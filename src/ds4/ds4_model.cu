@@ -15269,10 +15269,7 @@ struct Model::Impl {
             err = "DS4_HELPER_RECENT: EXL3 helpers currently support the static pool only";
             return false;
         }
-        if (nh > 1 && hr_want > 0) {
-            err = "DS4_HELPER_RECENT: one helper GPU only";
-            return false;
-        }
+        // (several helpers: the recent slots are helper 0's - its pool, stream, stage and table; hrmulti)
         hlp.clear();
         for (size_t i = 0; i < nh; ++i) {
             hlp.emplace_back();
@@ -15745,6 +15742,7 @@ struct Model::Impl {
             }
             uint8_t* at = l.hr_base + (size_t) f.slot * align256(l.blob);
             l.helper[(size_t) f.e] = at;
+            if (!l.hown.empty()) l.hown[(size_t) f.e] = 0;   // (several helpers: helper 0's - hrmulti)
             l.hr_slot[(size_t) f.e] = f.slot;
             l.hr_exp[(size_t) f.slot] = f.e;
             l.hr_stamp[(size_t) f.slot] = hr_clock;
@@ -15785,6 +15783,7 @@ struct Model::Impl {
                 if (l.hr_exp[(size_t) s] >= 0) {   // (out by its table entry alone: its file parts are where they were)
                     const int v = l.hr_exp[(size_t) s];
                     l.helper[(size_t) v] = nullptr;
+                    if (!l.hown.empty()) l.hown[(size_t) v] = 255;   // (no helper's - hrmulti)
                     l.hr_slot[(size_t) v] = -1;
                     l.hr_mirror[(size_t) v] = 0ull;
                     l.hr_exp[(size_t) s] = -1;
