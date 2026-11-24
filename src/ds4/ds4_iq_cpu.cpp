@@ -1810,6 +1810,14 @@ bool iq_cpu_fmt(int tg, int td, int n_embd, int n_ff, IqCpu& f, std::string& err
     f.d_row = n.d_row;
     f.act_bytes = n.act_bytes;
     f.h_bytes = n.h_bytes;
+    if (n.gu_act == GGML_TYPE_Q8_K && n_embd % QK_K == 0) {
+        f.gu_blk = QK_K;
+        f.gu_blk_bytes = ggml_type_size(GGML_TYPE_Q8_K);
+    }
+    if (n.d_act == GGML_TYPE_Q8_K && n_ff % QK_K == 0) {
+        f.d_blk = QK_K;
+        f.d_blk_bytes = ggml_type_size(GGML_TYPE_Q8_K);
+    }
     return true;
 }
 

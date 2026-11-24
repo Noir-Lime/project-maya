@@ -1549,6 +1549,18 @@ struct Model::Impl {
     std::atomic<int64_t> eg_pf_rows_n{0}, eg_pf_hits_n{0}, eg_pf_reads_n{0}, eg_pf_wait_ns{0}, eg_pf_io_ns{0};
     uint16_t* h_emb = nullptr;        // the window's embedding rows
     std::vector<float> c_xh, c_xsb, c_acc, c_xhd, c_xsd, c_accd, c_yd;
+    struct alignas(64) LaneFuseCnt { std::atomic<int> v{0}; };
+    struct LanePartSum {
+        Resp* rp = nullptr;
+        const int* tok_of = nullptr;
+        const float* wv = nullptr;
+        int nslots = 0;
+        int act_toks[kWin] = {};
+        int n_act = 0;
+        bool done = false;
+    };
+    std::unique_ptr<LaneFuseCnt[]> qb_rem, sum_rem;
+    size_t qb_rem_cap = 0, sum_rem_cap = 0;
     Exl3Lane lane_x;                            // (cpu_experts' view of them, ds4_cpu_exl3.hpp)
     // the state
     int64_t pos = 0;
@@ -4906,6 +4918,10 @@ struct Model::Impl {
             c_xsd.resize(S * (FF / 128));
             c_accd.resize((size_t) NH * S * DQ * (E / NH));
             c_yd.resize((size_t) lane_nm * S * E);   // (a tensor-parallel layer's: each member's part a block)
+            qb_rem_cap = S * std::max<size_t>(1, FF / 256);
+            qb_rem.reset(new LaneFuseCnt[qb_rem_cap]);
+            sum_rem_cap = (E + 63) / 64;
+            sum_rem.reset(new LaneFuseCnt[sum_rem_cap]);
         }
         // the experts: VRAM slots in what each device has left (after the PCIe lane's staging slots), the rest on the host
         if (!lane_alloc(err)) return false;
@@ -11333,10 +11349,11 @@ struct Model::Impl {
     // them, exact integer sums a block; every CPU tier the same bits): each token's input quantized once, whatever
     // number of entries take it, and each job its band of h straight into the down's int8 input.
     // (ord: the order the entries are computed in - their slots, so the sums, stay the same; null: as they are)
-    void cpu_experts_mx(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord) {
+    void cpu_experts_mx(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord,
+                        LanePartSum* ps = nullptr) {
         if (lane_par_layer(l)) return cpu_experts_par(l, x, ents, ldx, ord);   // (DS4_LANE_PARITY: the device's bits)
         const bool mx_gu = gg::expert_type(l.lay, 0) == gg::kTypeMXFP4, mx_d = gg::expert_type(l.lay, 2) == gg::kTypeMXFP4;
-        if (!mx_gu && !mx_d) return cpu_experts_iq(l, x, ents, ldx, ord);
+        if (!mx_gu && !mx_d) return cpu_experts_iq(l, x, ents, ldx, ord, ps);
         if (!mx_gu || !mx_d) return cpu_experts_both(l, x, ents, ldx, ord, mx_gu);
         constexpr int RB = 64;   // rows a job (whole blocks of h: RB % 32 == 0)
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH;
@@ -11666,7 +11683,8 @@ struct Model::Impl {
         return std::clamp(rows / (jobs * pools[0]->size()) / unit * unit, unit, 64);
     }
 
-    void cpu_experts_iq(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord) {
+    void cpu_experts_iq(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord,
+                        LanePartSum* ps = nullptr) {
         if (lane_par_layer(l)) return cpu_experts_par(l, x, ents, ldx, ord);
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH, ne = (int) ents.size();
         const int RB = lane_rows(ne * FFh, 8), RD = lane_rows(ne * Eh, 8);   // rows a job: gate / up, down
@@ -11696,25 +11714,67 @@ struct Model::Impl {
         // the activations in c_xh's bytes, E 4 apart: token t's (t < kWin) at row t - quantized once, whatever number of
         // entries take it - then a row a slot (kWin + slot): a token past the window's input (none on the decode or
         // chunk paths), then (x no longer needed) the slot's h
+        const bool par_ls = true;
         uint8_t* aq = (uint8_t*) c_xh.data();
         auto x_act = [&](const Ent& en, int i) -> uint8_t* {
             const int t = en.tok[i];
             return aq + (size_t) (t < kWin ? t : kWin + en.slot0 + i) * E * 4;
         };
         {
+            struct QaItem { const float* src; uint8_t* dst; };
+            QaItem qa_buf[kSlots];
+            std::vector<QaItem> qa_vec;
+            int nqa = 0;
             bool done[kWin] = {};
             for (const Ent& en : ents)
                 for (int i = 0; i < en.n; ++i) {
                     const int t = en.tok[i];
                     if (t < kWin && done[t]) continue;
                     if (t < kWin) done[t] = true;
-                    gg::iq_cpu_quant(fm.gu_act, x + (size_t) t * ldx, E, x_act(en, i));
+                    const QaItem item{x + (size_t) t * ldx, x_act(en, i)};
+                    if (nqa < kSlots && qa_vec.empty()) qa_buf[nqa++] = item;
+                    else {
+                        if (qa_vec.empty()) qa_vec.assign(qa_buf, qa_buf + nqa);
+                        qa_vec.push_back(item);
+                        ++nqa;
+                    }
                 }
+            const QaItem* qai = qa_vec.empty() ? qa_buf : qa_vec.data();
+            if (par_ls && nqa > 0 && fm.gu_blk > 0 && !pools.empty()) {
+                const int W = std::max(1, pools[0]->size());
+                const int nb = E / fm.gu_blk;
+                const int bpb = std::max(2, (nqa * nb + W - 1) / W);
+                const int jpt = (nb + bpb - 1) / bpb;
+                const int nj = nqa * jpt;
+                if (nj > 1) {
+                    pools[0]->run(nj, [&](int j) {
+                        const int it = j / jpt, blk0 = (j % jpt) * bpb;
+                        const int cnt = std::min(bpb, nb - blk0);
+                        gg::iq_cpu_quant(fm.gu_act, qai[it].src + (size_t) blk0 * fm.gu_blk,
+                                         cnt * fm.gu_blk, qai[it].dst + (size_t) blk0 * fm.gu_blk_bytes);
+                    });
+                } else {
+                    for (int it = 0; it < nqa; ++it) gg::iq_cpu_quant(fm.gu_act, qai[it].src, E, qai[it].dst);
+                }
+            } else {
+                for (int it = 0; it < nqa; ++it) gg::iq_cpu_quant(fm.gu_act, qai[it].src, E, qai[it].dst);
+            }
+        }
+        const bool fuse_qb = (par_ls && NH == 1 && fm.d_blk > 0);
+        const int d_nblk = fuse_qb ? FF / fm.d_blk : 0;
+        if (fuse_qb) {
+            const size_t need = (size_t) ne * (size_t) d_nblk;
+            if (qb_rem_cap < need) {
+                qb_rem.reset(new LaneFuseCnt[need]);
+                qb_rem_cap = need;
+            }
+            for (size_t idx = 0; idx < need; ++idx) qb_rem[idx].v.store(fm.d_blk, std::memory_order_relaxed);
         }
         std::function<void(int)> f[4];
         for (int X = 0; X < NH; ++X)
             f[X] = [&, X](int j) {
-                const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / GB] : j / GB)];
+                const int e_idx = ord != nullptr ? ord[j / GB] : j / GB;
+                const Ent& en = ents[(size_t) e_idx];
                 const int r0 = X * FFh + (j % GB) * RB, r1 = std::min(X * FFh + FFh, r0 + RB);
                 const void* ap[gg::kMxCpuMaxN];
                 float* hp[gg::kMxCpuMaxN];
@@ -11726,13 +11786,77 @@ struct Model::Impl {
                 // block size of the type)
                 gg::iq_cpu_gate_up(fm, ent_part(l, en, 0, X), ent_part(l, en, 1, X), ap, en.n, hp,
                                    r0 - X * FFh, r1 - X * FFh, lim);
+                if (fuse_qb) {
+                    const int bs = fm.d_blk;
+                    const size_t bb = fm.d_blk_bytes;
+                    const int blk0 = r0 / bs, blk1 = (r1 - 1) / bs;
+                    for (int blk = blk0; blk <= blk1; ++blk) {
+                        const int b0 = blk * bs, b1 = b0 + bs;
+                        const int got = std::min(r1, b1) - std::max(r0, b0);
+                        if (qb_rem[(size_t) e_idx * d_nblk + blk].v.fetch_sub(got, std::memory_order_acq_rel) == got) {
+                            for (int i = 0; i < en.n; ++i)
+                                gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF + (size_t) b0, bs,
+                                                 aq + (size_t) (kWin + en.slot0 + i) * E * 4 + (size_t) blk * bb);
+                        }
+                    }
+                }
             };
         if (lane_affine()) run_affine(ne * GB, f[0], GB, RB, FFh);
         else run_nodes(ne * GB, f);
-        for (const Ent& en : ents)
-            for (int i = 0; i < en.n; ++i)
-                gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF, FF,
-                                 aq + (size_t) (kWin + en.slot0 + i) * E * 4);
+        if (!fuse_qb) {
+            if (par_ls && fm.d_blk > 0 && !pools.empty()) {
+                int slots[kSlots];
+                std::vector<int> slots_vec;
+                int nqb = 0;
+                for (const Ent& en : ents)
+                    for (int i = 0; i < en.n; ++i) {
+                        const int sl = en.slot0 + i;
+                        if (nqb < kSlots && slots_vec.empty()) slots[nqb++] = sl;
+                        else {
+                            if (slots_vec.empty()) slots_vec.assign(slots, slots + nqb);
+                            slots_vec.push_back(sl);
+                            ++nqb;
+                        }
+                    }
+                const int* slp = slots_vec.empty() ? slots : slots_vec.data();
+                const int nb = FF / fm.d_blk;
+                constexpr int kBpb = 2;
+                const int jpt = (nb + kBpb - 1) / kBpb;
+                const int nj = nqb * jpt;
+                if (nj > 1) {
+                    pools[0]->run(nj, [&](int j) {
+                        const int it = j / jpt, blk0 = (j % jpt) * kBpb, sl = slp[it];
+                        const int cnt = std::min(kBpb, nb - blk0);
+                        gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) sl * FF + (size_t) blk0 * fm.d_blk,
+                                         cnt * fm.d_blk,
+                                         aq + (size_t) (kWin + sl) * E * 4 + (size_t) blk0 * fm.d_blk_bytes);
+                    });
+                } else {
+                    for (int it = 0; it < nqb; ++it)
+                        gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) slp[it] * FF, FF,
+                                         aq + (size_t) (kWin + slp[it]) * E * 4);
+                }
+            } else {
+                for (const Ent& en : ents)
+                    for (int i = 0; i < en.n; ++i)
+                        gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF, FF,
+                                         aq + (size_t) (kWin + en.slot0 + i) * E * 4);
+            }
+        }
+        const bool fuse_sum = (par_ls && ps != nullptr && ps->n_act > 0 && NH == 1);
+        const bool single_slot_each = (fuse_sum && ne == 1 && ps->nslots == ps->n_act);
+        constexpr int kSumChunk = 64;
+        const int sum_nc = fuse_sum ? (E + kSumChunk - 1) / kSumChunk : 0;
+        if (fuse_sum && !single_slot_each) {
+            if (sum_rem_cap < (size_t) sum_nc) {
+                sum_rem.reset(new LaneFuseCnt[(size_t) sum_nc]);
+                sum_rem_cap = (size_t) sum_nc;
+            }
+            for (int c = 0; c < sum_nc; ++c) {
+                const int c0 = c * kSumChunk, c1 = std::min(E, c0 + kSumChunk);
+                sum_rem[(size_t) c].v.store(ne * (c1 - c0), std::memory_order_relaxed);
+            }
+        }
         for (int X = 0; X < NH; ++X)
             f[X] = [&, X](int j) {
                 const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / DB] : j / DB)];
@@ -11744,9 +11868,45 @@ struct Model::Impl {
                     yp[i] = c_yd.data() + (size_t) (en.slot0 + i) * E + (size_t) X * Eh;   // (part X's rows of it)
                 }
                 gg::iq_cpu_down(fm, ent_part(l, en, 2, X), hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
+                if (fuse_sum) {
+                    if (single_slot_each) {
+                        for (int i = 0; i < en.n; ++i) {
+                            const float w = ps->wv[en.slot0 + i];
+                            const float* y = yp[i];
+                            float* o = ps->rp->part[en.tok[i]];
+                            for (int e = r0; e < r1; ++e) {
+                                o[e] = 0.0f;
+                                o[e] += w * y[e];
+                            }
+                        }
+                    } else {
+                        const int sc0 = r0 / kSumChunk, sc1 = (r1 - 1) / kSumChunk;
+                        for (int c = sc0; c <= sc1; ++c) {
+                            const int c0 = c * kSumChunk, c1 = std::min(E, c0 + kSumChunk);
+                            const int got = std::min(r1, c1) - std::max(r0, c0);
+                            if (sum_rem[(size_t) c].v.fetch_sub(got, std::memory_order_acq_rel) == got) {
+                                for (int ti = 0; ti < ps->n_act; ++ti) {
+                                    const int t = ps->act_toks[ti];
+                                    float* o = ps->rp->part[t];
+                                    for (int e = c0; e < c1; ++e) o[e] = 0.0f;
+                                    for (int sl = 0; sl < ps->nslots; ++sl) {
+                                        if (ps->tok_of[sl] != t) continue;
+                                        const float* y = c_yd.data() + (size_t) sl * E;
+                                        const float w = ps->wv[sl];
+                                        for (int e = c0; e < c1; ++e) o[e] += w * y[e];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             };
         if (lane_affine()) run_affine(ne * DB, f[0], DB, RD, Eh);
         else run_nodes(ne * DB, f);
+        if (fuse_sum) {
+            for (int ti = 0; ti < ps->n_act; ++ti) ps->rp->cpu[ps->act_toks[ti]] = 1;
+            ps->done = true;
+        }
     }
 
     // ... a layer of both (MXFP4 gate / up over a low-bit down, or the other way round): each role as its kind above -
@@ -11993,7 +12153,7 @@ struct Model::Impl {
     }
 
     void cpu_experts(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx = 0,
-                     const int* ord = nullptr) {
+                     const int* ord = nullptr, LanePartSum* ps = nullptr) {
         if (ldx == 0) ldx = (size_t) g.dim;
         static const bool stats = std::getenv("DS4_CPU_STATS") != nullptr;
         double tph = stats ? now_ms() : 0.0;
@@ -12009,7 +12169,7 @@ struct Model::Impl {
             for (const Ent& en : ents) cpu_rows += en.n;
         }
         if (l.packed_host) return cpu_experts_packed(l, x, ents, ldx, ord);
-        if (l.lay.fmt == gg::kFmtMXFP4) return cpu_experts_mx(l, x, ents, ldx, ord);
+        if (l.lay.fmt == gg::kFmtMXFP4) return cpu_experts_mx(l, x, ents, ldx, ord, ps);
         const int E = g.dim, FF = g.ff;
         Exl3Lane& c = lane_x;
         c.E = E;
@@ -15654,10 +15814,9 @@ struct Model::Impl {
     // (the service thread, after its own part of request seq) the helper's: its flag waited for - it took the request
     // (no picks of its own: the slot is free again), or answered it - no CUDA call; each token's sum then added into the
     // answer.  Failed or late (kHelperWaitMs): its picks on the CPU lane, now and from then on
-    void helper_answer(HelperCtx& H, const Layer& l, const Req& r, Resp& rp, unsigned seq, int T,
-                       const std::vector<std::pair<int, int>>& hp, std::vector<Ent>& ents) {
+    bool helper_wait(HelperCtx& H, Resp& rp, unsigned seq, int T, bool empty) {
         const int slot = (int) (seq % kRing);
-        const volatile unsigned* f = H.flags + (hp.empty() ? 0 : kRing) + slot;
+        const volatile unsigned* f = H.flags + (empty ? 0 : kRing) + slot;
         const double t0 = now_ms();
         bool ok = true;
         for (unsigned n = 0; *f != seq; ++n) {
@@ -15673,24 +15832,53 @@ struct Model::Impl {
             std::fprintf(stderr, "ds4: helper CUDA%d: no answer to request %u in %.0f ms - the CPU lane takes its picks "
                                  "from now on\n", H.id, seq, now_ms() - t0);
         if (!ok) st.helper_dead = 1;
-        if (hp.empty()) {
-            if (!ok && rh_lead) rh_fallback_flag(rp, slot, seq, T);
-            return;
-        }
+        if (empty && !ok && rh_lead) rh_fallback_flag(rp, slot, seq, T);
+        return ok;
+    }
+    void helper_answer(HelperCtx& H, const Layer& l, const Req& r, Resp& rp, unsigned seq, int T,
+                       const std::vector<std::pair<int, int>>& hp, std::vector<Ent>& ents) {
+        const bool ok = helper_wait(H, rp, seq, T, hp.empty());
+        if (hp.empty()) return;
+        helper_answer_ready(H, l, r, rp, seq, T, hp, ents, ok);
+    }
+    void helper_answer_ready(HelperCtx& H, const Layer& l, const Req& r, Resp& rp, unsigned seq, int T,
+                             const std::vector<std::pair<int, int>>& hp, std::vector<Ent>& ents, bool ok) {
+        const int slot = (int) (seq % kRing);
         const size_t D = (size_t) g.dim;
         unsigned tmask = 0;
         for (const auto& pk_ : hp) tmask |= 1u << (pk_.second / kPicks);
         if (ok && rh_cmp != 0) helper_cmp(l, r, seq, T, hp, ents, tmask);
         if (ok && rh_cmp != 2) {
-            for (int t = 0; t < T; ++t) {
-                if (!((tmask >> t) & 1u)) continue;
-                const float* y = H.res + ((size_t) slot * kWin + (size_t) t) * D;
-                float* o = rp.part[t];
-                if (rp.cpu[t])
-                    for (size_t e = 0; e < D; ++e) o[e] += y[e];
-                else
-                    for (size_t e = 0; e < D; ++e) o[e] = y[e];
-                rp.cpu[t] = 1;
+            int htoks[kWin];
+            int htok = 0;
+            for (int t = 0; t < T; ++t)
+                if ((tmask >> t) & 1u) htoks[htok++] = t;
+            if (true && htok >= 2 && !pools.empty()) {
+                constexpr size_t kHChunk = 256;
+                const int nc = (int) ((D + kHChunk - 1) / kHChunk);
+                pools[0]->run(htok * nc, [&](int j) {
+                    const int t = htoks[j / nc];
+                    const size_t c0 = (size_t) (j % nc) * kHChunk;
+                    const size_t c1 = std::min(D, c0 + kHChunk);
+                    const float* y = H.res + ((size_t) slot * kWin + (size_t) t) * D;
+                    float* o = rp.part[t];
+                    if (rp.cpu[t])
+                        for (size_t e = c0; e < c1; ++e) o[e] += y[e];
+                    else
+                        for (size_t e = c0; e < c1; ++e) o[e] = y[e];
+                });
+                for (int ti = 0; ti < htok; ++ti) rp.cpu[htoks[ti]] = 1;
+            } else {
+                for (int ti = 0; ti < htok; ++ti) {
+                    const int t = htoks[ti];
+                    const float* y = H.res + ((size_t) slot * kWin + (size_t) t) * D;
+                    float* o = rp.part[t];
+                    if (rp.cpu[t])
+                        for (size_t e = 0; e < D; ++e) o[e] += y[e];
+                    else
+                        for (size_t e = 0; e < D; ++e) o[e] = y[e];
+                    rp.cpu[t] = 1;
+                }
             }
             st.helper_experts += (int64_t) hp.size();
             return;
@@ -16313,15 +16501,31 @@ struct Model::Impl {
                 }
                 if (!ents.empty()) {
                     const double tc = now_ms();
-                    if (store && store->covers(l.il)) cpu_experts_store(l, &r.x[0][0], ents, (size_t) kMaxDim, po);
-                    else cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, po);
+                    const bool own = lane_par && lane_par_layer(l);
+                    LanePartSum ps;
+                    const bool use_store = store && store->covers(l.il);
+                    if (!own && NH == 1 && !use_store && T <= kWin) {
+                        ps.rp = &rp;
+                        ps.tok_of = tok_of;
+                        ps.wv = wv;
+                        ps.nslots = nslots;
+                        bool seen[kWin] = {};
+                        for (int sl = 0; sl < nslots; ++sl) {
+                            const int t = tok_of[sl];
+                            if (t >= 0 && t < T && !seen[t]) {
+                                seen[t] = true;
+                                ps.act_toks[ps.n_act++] = t;
+                            }
+                        }
+                    }
+                    if (use_store) cpu_experts_store(l, &r.x[0][0], ents, (size_t) kMaxDim, po);
+                    else cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, po, ps.n_act > 0 ? &ps : nullptr);
                     lt.c_ms = now_ms() - tc;
                     lt.n_cpu = (int) ents.size();
                     const int D = g.dim;
                     // (DS4_LANE_PARITY: each slot's output as its pick's own part - the device sums it in the pick's
                     //  place, as it would have summed the expert from its VRAM; no weighted sum here.  A tensor-parallel
                     //  layer: a part a member, each member's own row of the picks)
-                    const bool own = lane_par && lane_par_layer(l);
                     if (own) {
                         const int nm = l.nm > 1 ? l.nm : 1;
                         for (int m = 0; m < nm; ++m) {
@@ -16335,7 +16539,7 @@ struct Model::Impl {
                             }
                         }
                     }
-                    for (int t = 0; !own && t < T; ++t) {
+                    for (int t = 0; !own && !ps.done && t < T; ++t) {
                         bool any = false;
                         for (int sl = 0; sl < nslots; ++sl) any = any || tok_of[sl] == t;
                         if (!any) continue;
@@ -16354,10 +16558,84 @@ struct Model::Impl {
                 }
                 if (lc >= 0) lane_answer(ln_cls[(size_t) lc], lt);
                 if (hon) {   // (each helper with experts of the layer: its picks, its flag, its sums added into the answer)
-                    for (size_t hi = 0; hi < hlp.size(); ++hi) {
-                        if (htab_of(l, hlp[hi]) == nullptr) continue;
-                        std::sort(hpv[hi].begin(), hpv[hi].end());
-                        helper_answer(hlp[hi], l, r, rp, next, T, hpv[hi], hents);
+                    if (!true || rh_cmp != 0 || pools.empty()) {
+                        for (size_t hi = 0; hi < hlp.size(); ++hi) {
+                            if (htab_of(l, hlp[hi]) == nullptr) continue;
+                            std::sort(hpv[hi].begin(), hpv[hi].end());
+                            helper_answer(hlp[hi], l, r, rp, next, T, hpv[hi], hents);
+                        }
+                    } else {
+                        const int slot = (int) (next % kRing);
+                        const size_t D = (size_t) g.dim;
+                        for (size_t hi = 0; hi < hlp.size();) {
+                            if (htab_of(l, hlp[hi]) == nullptr) { ++hi; continue; }
+                            const bool ok0 = helper_wait(hlp[hi], rp, next, T, hpv[hi].empty());
+                            if (hpv[hi].empty()) { ++hi; continue; }
+                            if (!ok0) {
+                                std::sort(hpv[hi].begin(), hpv[hi].end());
+                                helper_answer_ready(hlp[hi], l, r, rp, next, T, hpv[hi], hents, false);
+                                ++hi;
+                                continue;
+                            }
+                            const float* bh_ptr[kWin][8] = {};
+                            int bh_n[kWin] = {};
+                            int total_ops = 0;
+                            int n_h = 0;
+                            auto add_h = [&](size_t idx) {
+                                unsigned tmask = 0;
+                                for (const auto& pk_ : hpv[idx]) tmask |= 1u << (pk_.second / kPicks);
+                                for (int t = 0; t < T; ++t) {
+                                    if (!((tmask >> t) & 1u)) continue;
+                                    bh_ptr[t][bh_n[t]++] = hlp[idx].res + ((size_t) slot * kWin + (size_t) t) * D;
+                                    ++total_ops;
+                                }
+                                st.helper_experts += (int64_t) hpv[idx].size();
+                                ++n_h;
+                            };
+                            add_h(hi);
+                            size_t hj = hi + 1;
+                            bool need_acq = false;
+                            for (; hj < hlp.size(); ++hj) {
+                                if (htab_of(l, hlp[hj]) == nullptr) continue;
+                                if (n_h >= 8) break;
+                                const volatile unsigned* fj = hlp[hj].flags + (hpv[hj].empty() ? 0 : kRing) + slot;
+                                if (*fj != next) break;
+                                need_acq = true;
+                                if (hpv[hj].empty()) continue;
+                                add_h(hj);
+                            }
+                            if (need_acq) std::atomic_thread_fence(std::memory_order_acquire);
+                            if (total_ops == 1) {
+                                for (int t = 0; t < T; ++t) {
+                                    if (bh_n[t] == 0) continue;
+                                    const float* y = bh_ptr[t][0];
+                                    float* o = rp.part[t];
+                                    if (rp.cpu[t]) for (size_t e = 0; e < D; ++e) o[e] += y[e];
+                                    else for (size_t e = 0; e < D; ++e) o[e] = y[e];
+                                    rp.cpu[t] = 1;
+                                }
+                            } else if (total_ops >= 2) {
+                                int act_t[kWin], na = 0;
+                                for (int t = 0; t < T; ++t) if (bh_n[t] > 0) act_t[na++] = t;
+                                constexpr size_t kHChunk = 256;
+                                const int nc = (int) ((D + kHChunk - 1) / kHChunk);
+                                pools[0]->run(na * nc, [&](int j) {
+                                    const int t = act_t[j / nc];
+                                    const size_t c0 = (size_t) (j % nc) * kHChunk;
+                                    const size_t c1 = std::min(D, c0 + kHChunk);
+                                    float* o = rp.part[t];
+                                    bool has_cpu = (rp.cpu[t] != 0);
+                                    const int cnt = bh_n[t];
+                                    for (int k = 0; k < cnt; ++k) {
+                                        const float* y = bh_ptr[t][k];
+                                        if (has_cpu) for (size_t e = c0; e < c1; ++e) o[e] += y[e];
+                                        else { for (size_t e = c0; e < c1; ++e) o[e] = y[e]; has_cpu = true; }
+                                    }
+                                });
+                                for (int k = 0; k < na; ++k) rp.cpu[act_t[k]] = 1;
+                            }
+                            hi = hj;
+                        }
                     }
                 }
             }

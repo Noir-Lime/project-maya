@@ -23,8 +23,10 @@ void mx_cpu_rows(const uint8_t* w, size_t rb, int k, int r0, int r1, const float
 struct IqCpu {
     int tg = 0, td = 0, n_embd = 0, n_ff = 0;
     int gu_act = 0, d_act = 0;                 // the activations' ggml types
+    int gu_blk = 0, d_blk = 0;                 // block size when activation quant is block-independent
     size_t gu_row = 0, d_row = 0;              // bytes a weight row
     size_t act_bytes = 0, h_bytes = 0;         // bytes of x (n_embd) and of h (n_ff) as those
+    size_t gu_blk_bytes = 0, d_blk_bytes = 0;  // bytes per independent activation block
 };
 /// The layer's geometry; false (err) when this build or ggml-cpu cannot take it.
 bool iq_cpu_fmt(int tg, int td, int n_embd, int n_ff, IqCpu& f, std::string& err);
