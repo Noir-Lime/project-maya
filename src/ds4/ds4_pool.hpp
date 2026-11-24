@@ -36,7 +36,7 @@ class Pool {
 public:
     explicit Pool(int n, const std::vector<int>& cpus = {}, int spin_us = 200) : spin_us_(spin_us) {
         for (int i = 0; i < n; ++i) {
-            th_.emplace_back([this] { loop(); });
+            th_.emplace_back([this, i] { loop(i); });
             if (!cpus.empty()) os::pin_thread(th_.back(), cpus[(size_t) i % cpus.size()]);
         }
     }
@@ -63,6 +63,7 @@ public:
         const uint64_t g = (gen_.load(std::memory_order_relaxed) + 1) & 0xffffffffu;
         ticket_.store((g << 32) | 0x7fffffffu, std::memory_order_seq_cst);
         fn_ = &fn;
+        affine_.store(false, std::memory_order_relaxed);
         total_.store(n, std::memory_order_release);
         done_.store(0, std::memory_order_relaxed);
         ticket_.store(g << 32, std::memory_order_release);
@@ -75,8 +76,43 @@ public:
             cv_.notify_all();
         }
     }
+    /// (DS4_LANE_AFFINE) start() with ownership: participant p (worker i = p, the caller size() - 1) takes the jobs j
+    /// with owner(j) == p first, by a ticket of its own, then the others' (p + 1, p + 2, ..: its neighbours first)
+    void start_affine(int n, const std::function<void(int)>& fn, const std::function<int(int)>& owner) {
+        const int W = size();
+        if (n <= 0 || W > kMaxPart) return start(n, fn);
+        own_.resize((size_t) n);
+        perm_.resize((size_t) n);
+        cnt_.assign((size_t) W, 0);
+        for (int j = 0; j < n; ++j) {
+            const int p = std::min(std::max(owner(j), 0), W - 1);
+            own_[(size_t) j] = p;
+            ++cnt_[(size_t) p];
+        }
+        for (int p = 0; p < W; ++p)
+            if (cnt_[(size_t) p] > 0xffff) return start(n, fn);
+        base_.assign((size_t) W + 1, 0);
+        for (int p = 0; p < W; ++p) base_[(size_t) p + 1] = base_[(size_t) p] + cnt_[(size_t) p];
+        fill_.assign(base_.begin(), base_.end() - 1);
+        for (int j = 0; j < n; ++j) perm_[(size_t) fill_[(size_t) own_[(size_t) j]]++] = j;
+        n_ = n;
+        const uint64_t g = (gen_.load(std::memory_order_relaxed) + 1) & 0xffffffffu;
+        ticket_.store((g << 32) | 0x7fffffffu, std::memory_order_seq_cst);   // (the shared ticket: closed)
+        fn_ = &fn;
+        affine_.store(true, std::memory_order_relaxed);
+        total_.store(n, std::memory_order_release);
+        done_.store(0, std::memory_order_relaxed);
+        for (int p = 0; p < W; ++p)
+            pt_[p].t.store((g << 32) | ((uint64_t) cnt_[(size_t) p] << 16), std::memory_order_release);
+        gen_.store(g, std::memory_order_release);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (sleeping_.load(std::memory_order_acquire) > 0) {
+            std::lock_guard<std::mutex> lk(mu_);
+            cv_.notify_all();
+        }
+    }
     void help() {
-        if (n_ > 0) work(gen_.load(std::memory_order_acquire));
+        if (n_ > 0) work(gen_.load(std::memory_order_acquire), size() - 1);
     }
     void wait() {
         if (n_ <= 0) return;
@@ -85,7 +121,23 @@ public:
     }
 
 private:
-    void work(uint64_t g) {
+    void work_affine(uint64_t g, int me) {
+        const int W = size();
+        for (int k = 0; k < W; ++k) {
+            const int q = (me + k) % W;
+            for (;;) {
+                uint64_t t = pt_[q].t.load(std::memory_order_acquire);
+                if ((t >> 32) != g) return;
+                const int i = (int) (t & 0xffffu), c = (int) ((t >> 16) & 0xffffu);
+                if (i >= c) break;   // (q's jobs all taken: the next one's)
+                if (!pt_[q].t.compare_exchange_weak(t, t + 1, std::memory_order_acq_rel)) continue;
+                (*fn_)(perm_[(size_t) (base_[(size_t) q] + i)]);
+                done_.fetch_add(1, std::memory_order_acq_rel);
+            }
+        }
+    }
+    void work(uint64_t g, int me) {
+        if (affine_.load(std::memory_order_acquire)) return work_affine(g, me);
         for (;;) {
             uint64_t t = ticket_.load(std::memory_order_acquire);
             if ((t >> 32) != g) return;
@@ -96,7 +148,7 @@ private:
             done_.fetch_add(1, std::memory_order_acq_rel);
         }
     }
-    void loop() {
+    void loop(int me) {
         uint64_t seen = 0;   // (gen_ at construction: a batch start()ed before this thread first ran is still new)
         for (;;) {
             const auto t0 = std::chrono::steady_clock::now();
@@ -114,7 +166,7 @@ private:
             }
             if (quit_.load()) return;
             seen = g;
-            work(g);
+            work(g, me);
         }
     }
 
@@ -126,6 +178,14 @@ private:
     alignas(64) std::atomic<uint64_t> gen_{0};
     alignas(64) std::atomic<int> total_{0};
     alignas(64) std::atomic<int> done_{0};
+    // (start_affine) the participants' tickets, a cache line each; participant p's jobs at perm_[base_[p] + i]
+    static constexpr int kMaxPart = 128;
+    struct alignas(64) PartTicket {
+        std::atomic<uint64_t> t{0};
+    };
+    PartTicket pt_[kMaxPart];
+    std::vector<int> perm_, base_, cnt_, own_, fill_;
+    std::atomic<bool> affine_{false};
     std::atomic<int> sleeping_{0};
     std::atomic<bool> quit_{false};
     std::mutex mu_;

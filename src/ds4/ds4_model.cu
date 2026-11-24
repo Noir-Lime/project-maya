@@ -11558,6 +11558,22 @@ struct Model::Impl {
     // (DS4_LANE_PARITY: the device's arithmetic instead, cpu_experts_par, where the layer's types have its rows)
     // rows a CPU-lane job (DS4_LANE_JOBS, ds4_model.hpp): 64, or with jobs > 0 about rows / (jobs x the pool's
     // threads), rounded down to `unit` and kept in [unit, 64]
+    // (DS4_LANE_AFFINE=1, one pool) a batch of row jobs by ownership: participant p of pools[0] first takes the jobs
+    // whose first row is in its share [p rows / W, (p + 1) rows / W) of each expert (job j: chunk j % per, rows_job a
+    // chunk), the same rows every call - see Pool::start_affine.  The same jobs and code: the same bits
+    bool lane_affine() const {
+        static const bool on = [] {
+            const char* v = ds4_env("DS4_LANE_AFFINE");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        return on && NH == 1 && pools.size() == 1;
+    }
+    void run_affine(int n, const std::function<void(int)>& f, int per, int rows_job, int rows) {
+        const int W = pools[0]->size();
+        pools[0]->start_affine(n, f, [&](int j) { return (int) ((int64_t) (j % per) * rows_job * W / rows); });
+        pools[0]->help();
+        pools[0]->wait();
+    }
     int lane_rows(int rows, int unit) const {
         int jobs = g_lane_jobs.load(std::memory_order_relaxed);
         if (jobs < 0) {
@@ -11631,7 +11647,8 @@ struct Model::Impl {
                 gg::iq_cpu_gate_up(fm, ent_part(l, en, 0, X), ent_part(l, en, 1, X), ap, en.n, hp,
                                    r0 - X * FFh, r1 - X * FFh, lim);
             };
-        run_nodes(ne * GB, f);
+        if (lane_affine()) run_affine(ne * GB, f[0], GB, RB, FFh);
+        else run_nodes(ne * GB, f);
         for (const Ent& en : ents)
             for (int i = 0; i < en.n; ++i)
                 gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF, FF,
@@ -11648,7 +11665,8 @@ struct Model::Impl {
                 }
                 gg::iq_cpu_down(fm, ent_part(l, en, 2, X), hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
             };
-        run_nodes(ne * DB, f);
+        if (lane_affine()) run_affine(ne * DB, f[0], DB, RD, Eh);
+        else run_nodes(ne * DB, f);
     }
 
     // ... a layer of both (MXFP4 gate / up over a low-bit down, or the other way round): each role as its kind above -
