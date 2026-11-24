@@ -6063,38 +6063,48 @@ static bool attn_mma_now() {
 // allocated at the first window; null where it is off or the card has no room (then sparse_attn_mma_kernel)
 static int attn_split_runs() {
     static const int nb = [] {
-        const char* v = std::getenv("DS4_ATTN_WIN_SPLIT");
+        const char* v = std::getenv("MAYA_DS4_ATTN_WIN_SPLIT");
+        if (v == nullptr) v = std::getenv("DS4_ATTN_WIN_SPLIT");
         const int n = v != nullptr ? std::atoi(v) : 8;
         return n < 2 ? 0 : std::min(16, n);
     }();
     return nb;
 }
-static float* attn_split_part(int heads) {
+static float* attn_split_part(int heads, cudaStream_t s) {
     const int nb = attn_split_runs();
     if (nb == 0) return nullptr;
+    struct SplitBuf {
+        int dev = -1;
+        cudaStream_t s = nullptr;
+        int heads = 0;
+        float* ptr = nullptr;
+        size_t bytes = 0;
+    };
     static std::mutex mu;
-    static float* part[64] = {};
-    static int part_heads[64] = {};
+    static std::vector<SplitBuf> bufs;
     int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return nullptr;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0) return nullptr;
     std::lock_guard<std::mutex> lk(mu);
-    if (part_heads[dev] < 0) return nullptr;
-    if (part_heads[dev] < heads) {
-        if (part[dev] != nullptr) return nullptr;   // (a second, wider layer: keep the first buffer, the old kernel there)
-        const size_t n = (size_t) kAttnScratchT * (size_t) heads * (size_t) nb * kAttnPart * sizeof(float);
-        if (cudaMalloc(&part[dev], n) != cudaSuccess) {
-            cudaGetLastError();
-            part[dev] = nullptr;
-            part_heads[dev] = -1;
-            std::fprintf(stderr, "ds4: CUDA%d has no %zu MB for the split window attention - the one-block kernel\n", dev,
-                         n >> 20);
-            return nullptr;
+    for (const auto& e : bufs) {
+        if (e.dev == dev && e.s == s) {
+            if (e.heads < 0 || e.heads < heads) return nullptr;
+            return e.ptr;
         }
-        part_heads[dev] = heads;
-        std::fprintf(stderr, "ds4: CUDA%d decode windows' attention on the tensor cores, %d runs a query (DS4_ATTN_WIN_SPLIT)\n",
-                     dev, nb);
     }
-    return part[dev];
+    const size_t n = (size_t) kAttnScratchT * (size_t) heads * (size_t) nb * kAttnPart * sizeof(float);
+    float* ptr = nullptr;
+    if (cudaMalloc(&ptr, n) != cudaSuccess) {
+        cudaGetLastError();
+        bufs.push_back({dev, s, -1, nullptr, 0});
+        std::fprintf(stderr, "ds4: CUDA%d stream=%p has no %zu MB for the split window attention - the one-block kernel\n",
+                     dev, (const void*) s, n >> 20);
+        return nullptr;
+    }
+    bufs.push_back({dev, s, heads, ptr, n});
+    std::fprintf(stderr,
+                 "ds4: CUDA%d stream=%p decode windows' attention on the tensor cores, %d runs a query (DS4_ATTN_WIN_SPLIT)\n",
+                 dev, (const void*) s, nb);
+    return ptr;
 }
 #endif
 
@@ -6140,7 +6150,7 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
         if (attn_mma_now() && heads % 16 == 0) {
             // DS4_ATTN_WIN_SPLIT=<runs> (2..16; 8 unless set, 0 / 1: off): a decode window's queries (T up to
             // kAttnScratchT - only DS4_ATTN_WIN_MMA sends such here) on the split kernel and its merge
-            if (float* part = T <= kAttnScratchT ? attn_split_part(heads) : nullptr) {
+            if (float* part = T <= kAttnScratchT ? attn_split_part(heads, s) : nullptr) {
                 const int nb = attn_split_runs();
                 pdl_launch(sparse_attn_mma_split_kernel, dim3(heads / 16, T, nb), kThreads, 0, s, q, win,
                            (const uint8_t*) ckv, sel, sel_stride, a, heads, scale, part);
