@@ -97,11 +97,11 @@ def geni(eng, prompt: list[int], pics_path: str, max_new: int, spec: int = 0, ti
 
 
 def meta_pics(path: str) -> list[tuple[int, int]] | None:
-    """A slot's .meta (DS4META3): its pictures (start, hash) - None: not one of the engine's, or damaged."""
+    """A slot's .meta (DS4META4 or legacy DS4META3): its pictures (start, hash) - None: foreign or damaged."""
     try:
         data = open(path, "rb").read()
         m0, il = struct.unpack_from("<QQ", data, 0)
-        if m0 != SK.META_MAGIC:
+        if m0 not in SK.META_MAGICS:
             return None
         size, nt = struct.unpack_from("<QQ", data, 16 + il)
         (nc,) = struct.unpack_from("<Q", data, 32 + il + 4 * nt)
@@ -113,10 +113,13 @@ def meta_pics(path: str) -> list[tuple[int, int]] | None:
             start, h = struct.unpack_from("<qQ", data, off)
             pics.append((start, h))
             off += 16
+        if m0 == SK.META_MAGIC:
+            (al,) = struct.unpack_from("<Q", data, off)
+            off += 8 + al
         (m1,) = struct.unpack_from("<Q", data, off)
     except (OSError, struct.error):
         return None
-    return pics if m1 == SK.META_MAGIC else None
+    return pics if m1 == m0 else None
 
 
 def run(exe: str, gpus: list[int], pack: str, ctx: int, slots: str, keep: bool,

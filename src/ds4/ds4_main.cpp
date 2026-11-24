@@ -951,7 +951,8 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
     std::vector<Slot> slots;
     uint64_t slot_clock = 0, slot_seq = 0;
     const std::string slot_identity = m.slot_identity();
-    constexpr uint64_t kMetaMagic = 0x344154454d345344ull;   // "DS4META4" (little endian): META3 + the projection
+    constexpr uint64_t kMetaMagic = 0x344154454d345344ull;     // "DS4META4" (little endian): META3 + the projection
+    constexpr uint64_t kMetaMagicV3 = 0x334154454d345344ull;   // "DS4META3" (little endian): prior format, no projection
     const auto note = [&](const std::string& msg) {
         std::fprintf(stderr, "ds4 slots: %s\n", msg.c_str());
         std::printf("NOTE sessions: %s\n", msg.c_str());
@@ -1002,7 +1003,8 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
                                std::vector<int64_t>& cks, std::vector<Pic>& pics, std::string& abl) -> bool {
         std::ifstream f(path, std::ios::binary);
         uint64_t m0 = 0, il = 0, nt = 0, nc = 0, np = 0, al = 0, m1 = 0;
-        if (!f.read((char*) &m0, 8) || m0 != kMetaMagic || !f.read((char*) &il, 8) || il != slot_identity.size())
+        if (!f.read((char*) &m0, 8) || (m0 != kMetaMagic && m0 != kMetaMagicV3) || !f.read((char*) &il, 8) ||
+            il != slot_identity.size())
             return false;
         std::string id(il, '\0');
         if (!f.read(id.data(), (std::streamsize) il) || id != slot_identity) return false;
@@ -1022,10 +1024,14 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
             if (q.start < 0 || (uint64_t) q.start >= nt || (k > 0 && q.start <= pics.back().start)) return false;
             pics.push_back(q);
         }
-        if (!f.read((char*) &al, 8) || al > 256) return false;
-        abl.assign(al, '\0');
-        if (!f.read(abl.data(), (std::streamsize) al)) return false;
-        if (!f.read((char*) &m1, 8) || m1 != kMetaMagic) return false;
+        if (m0 == kMetaMagic) {
+            if (!f.read((char*) &al, 8) || al > 256) return false;
+            abl.assign(al, '\0');
+            if (!f.read(abl.data(), (std::streamsize) al)) return false;
+        } else {
+            abl.clear();   // DS4META3 predates kept abliterated slots: treat as unablated
+        }
+        if (!f.read((char*) &m1, 8) || m1 != m0) return false;
         for (int64_t c : cks)
             if (c <= 0 || (uint64_t) c > nt) return false;
         return true;

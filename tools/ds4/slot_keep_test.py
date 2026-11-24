@@ -92,7 +92,9 @@ def _readable(stream, timeout_s: float) -> bool:
 
 
 CORPUS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tokenizer_corpus.txt")
-META_MAGIC = 0x344154454d345344   # "DS4META4" (little endian): a slot's .meta, as src/ds4/ds4_main.cpp writes it
+META_MAGIC = 0x344154454d345344      # "DS4META4" (little endian): a slot's .meta, as src/ds4/ds4_main.cpp writes it
+META_MAGIC_V3 = 0x334154454d345344   # "DS4META3" (little endian): prior format without the projection field
+META_MAGICS = (META_MAGIC, META_MAGIC_V3)
 DS4_ENV = ("DS4_", "MAYA_DS4_", "STRATA_DS4_")   # (the engine's own names: it takes an older STRATA_DS4_* as MAYA_DS4_* at start)
 
 
@@ -123,7 +125,7 @@ def meta_read(path: str) -> tuple[list[int], str] | None:
         with open(path, "rb") as f:
             data = f.read()
         m0, il = struct.unpack_from("<QQ", data, 0)
-        if m0 != META_MAGIC:
+        if m0 not in META_MAGICS:
             return None
         size, nt = struct.unpack_from("<QQ", data, 16 + il)
         toks = list(struct.unpack_from("<%di" % nt, data, 32 + il))
@@ -131,12 +133,16 @@ def meta_read(path: str) -> tuple[list[int], str] | None:
         off = 40 + il + 4 * nt + 8 * nc
         (np,) = struct.unpack_from("<Q", data, off)
         off += 8 + 16 * np
-        (al,) = struct.unpack_from("<Q", data, off)
-        abl = data[off + 8:off + 8 + al].decode("ascii", "replace")
-        (m1,) = struct.unpack_from("<Q", data, off + 8 + al)
+        if m0 == META_MAGIC:
+            (al,) = struct.unpack_from("<Q", data, off)
+            abl = data[off + 8:off + 8 + al].decode("ascii", "replace")
+            off += 8 + al
+        else:
+            abl = ""
+        (m1,) = struct.unpack_from("<Q", data, off)
     except (OSError, struct.error):
         return None
-    return (toks, abl) if m1 == META_MAGIC else None
+    return (toks, abl) if m1 == m0 else None
 
 
 class Engine:
