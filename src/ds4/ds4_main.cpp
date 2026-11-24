@@ -745,6 +745,7 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "rid") r.rid = std::atoll(v.c_str());
         else if (k == "ablate") r.ablate = std::atoi(v.c_str()) != 0;
         else if (k == "cold") r.cold = std::atoi(v.c_str()) != 0;
+        else if (k == "lanejobs") maya::ds4::g_lane_jobs.store(std::atoi(v.c_str()));   // (tests: DS4_LANE_JOBS from here on)
         else if (k == "marks") {
             for (int x : parse_ids(v))
                 if (x > 0) r.marks.push_back(x);

@@ -14,6 +14,7 @@
 
 #include "ds4_logprobs.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -437,5 +438,10 @@ private:
     bool feed_part_(const FeedPlan& plan, const int* tokens, int k0, int k1, std::string& err);
     std::unique_ptr<Impl> p_;
 };
+
+// DS4_LANE_JOBS (0, the default: 64 rows a job): the CPU lane cuts an expert call's rows into about that many jobs
+// a lane thread - fewer rows a job when a call is small, so its last round of jobs leaves fewer threads idle.  Whole
+// rows either way: the same sums.  -1 until read; the raw protocol's lanejobs= key sets it (tests)
+inline std::atomic<int> g_lane_jobs{-1};
 
 }  // namespace maya::ds4
