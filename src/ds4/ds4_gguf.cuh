@@ -71,7 +71,7 @@ bool q8_batch_check(int dev, std::string& err);
 /// x3::mv's contract for GGUF matrices (F32 activations): each job's m->fmt kFmtBF16 (raw = BF16 [n][ld], ld values a
 /// row), kFmtMXFP4 (raw = MXFP4 [n][k / 32] blocks, ld bytes a row; 0: mx_row_bytes(k)) - an expert's matrix in VRAM -
 /// or kFmtQ8_0 (raw = Q8_0 [n][k / 32] blocks, ld bytes a row; 0: q8_row_bytes(k)).
-bool mv(const x3::MvJob* jobs, int n, cudaStream_t s);
+bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, bool fast = false);
 /// (DS4_HC_FUSE) an F32 input x of k values already rounded to int8 as mv rounds a Q8_0 job's (q [k], d [k / 32]: see
 /// hc_split_pre_norm): a kFmtQ8_0 job whose xf is x, its k this k and one activation reads them instead of rounding x
 /// again; every other job (another input, format, k, or more activations) rounds its own as before.
@@ -82,7 +82,7 @@ struct PreQ8 {
     int k = 0;
     int rows = 1;   // (DS4_HC_FUSE=2: a window's rows of x, k apart; their int8 rows k apart, scales k / 32 apart)
 };
-bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre);
+bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre, bool fast = false);
 /// The int8 rounding mv gives a kFmtQ8_0 job's one F32 input of k values (DS4_Q8_BATCH: its batched launch's, else the
 /// per-job one's) - what the HC fuse check compares hc_split_pre_norm's against.
 void q8_round(const float* x, int k, int8_t* q, float* d, cudaStream_t s);

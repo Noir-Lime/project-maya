@@ -1831,9 +1831,9 @@ x3::Mat view(const x3::Mat& m, int c0, int nc) {
     return v;
 }
 
-bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) { return mv(jobs, n, s, nullptr); }
+bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, bool fast) { return mv(jobs, n, s, nullptr, fast); }
 
-bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre) {
+bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre, bool fast) {
     if (n <= 0 || n > x3::kMaxMvJobs) return false;
     BfJobs J[3] = {};   // the BF16 jobs, the MXFP4 ones, the Q8_0 ones: a launch each
     int nj[3] = {0, 0, 0}, max_n[3] = {0, 0, 0}, max_c[3] = {1, 1, 1};
@@ -1918,7 +1918,7 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre) {
     }
     QR.flush(s);
     for (int f = 0; f < 3; ++f) mv_set(f, J[f], nj[f], max_n[f], max_c[f], vec[f], s);
-    if (nij > 0 && !iq::mv(IJ, nij, s)) {
+    if (nij > 0 && !iq::mv(IJ, nij, s, fast)) {
         fail("mv: a low-bit job not covered");
         return false;
     }

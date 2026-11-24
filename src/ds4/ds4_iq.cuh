@@ -162,7 +162,7 @@ struct MvJob {
     const float* bias = nullptr;
     float alpha = 1.0f;
 };
-bool mv(const MvJob* jobs, int n, cudaStream_t s);
+bool mv(const MvJob* jobs, int n, cudaStream_t s, bool fast = false);
 /// H jobs alike but for their offsets, in one launch (a 3D matrix's heads): job h = b with w + h w_stride (bytes),
 /// xq + h xq_stride, xd + h xd_stride, y + h y_stride; each row's sums as mv's.  false: a type or size mv refuses.
 bool mv_heads(const MvJob& b, int H, size_t w_stride, size_t xq_stride, size_t xd_stride, size_t y_stride,

@@ -1329,6 +1329,84 @@ static bool q8_wide() {
     static const bool on = !(std::getenv("MAYA_IQ_Q8_WIDE") && std::getenv("MAYA_IQ_Q8_WIDE")[0] == '0');
     return on;
 }
+// aligned 32-bit Q6_K decoder in registers (zero SMEM, zero barriers)
+__device__ __forceinline__ void decode_q6k_fast(const uint8_t* __restrict__ row, int kb, Sub& s) {
+    const int ib = kb & 7;
+    const uint8_t* b = row + (size_t) (kb >> 3) * 210;
+    const int hf = ib >> 2, qt = ib & 3;
+    const uint8_t* ql = b + 64 * hf + 32 * (qt & 1);
+    const uint8_t* qh = b + 128 + 32 * hf;
+    const int8_t* sc = (const int8_t*) (b + 192 + 8 * hf + 2 * qt);
+    uint32_t qlv[8], qhv[8];
+    if (((uintptr_t) ql & 3u) == 0u) {
+        const uint32_t* pql = (const uint32_t*) ql;
+        const uint32_t* pqh = (const uint32_t*) qh;
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            qlv[t] = pql[t];
+            qhv[t] = pqh[t];
+        }
+    } else if (kb >= 8 || hf != 0 || (qt & 1) != 0) {
+        const uint32_t* pql = (const uint32_t*) (ql - 2);
+        const uint32_t* pqh = (const uint32_t*) (qh - 2);
+        uint32_t l_prev = pql[0], h_prev = pqh[0];
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            const uint32_t l_next = pql[t + 1];
+            const uint32_t h_next = pqh[t + 1];
+            qlv[t] = __funnelshift_r(l_prev, l_next, 16);
+            qhv[t] = __funnelshift_r(h_prev, h_next, 16);
+            l_prev = l_next;
+            h_prev = h_next;
+        }
+    } else {
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            qlv[t] = ld2(ql + 4 * t);
+            qhv[t] = ld2(qh + 4 * t);
+        }
+    }
+    const int shl = 4 * (qt >> 1), shh = 2 * qt;
+#pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        const uint32_t v = ((qlv[t] >> shl) & 0x0f0f0f0fu) | (((qhv[t] >> shh) & 0x03030303u) << 4);
+        const uint32_t lo = (~v) & 0x20202020u;
+        s.q[t] = (int) ((v ^ 0x20202020u) | (lo << 1) | (lo << 2));
+    }
+    s.s0 = sc[0];
+    s.s1 = sc[1];
+    s.d = h2f(b + 208);
+}
+template <int T, int NC>
+__global__ void __launch_bounds__(kThreads) mv_fast_kernel(const Jobs J) {
+    pdl_wait();
+    pdl_trigger();
+    const MvJob& b = J.j[blockIdx.y];
+    const int row = blockIdx.x * kWarps + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= b.n) return;
+    const uint8_t* w = b.w + (size_t) row * b.ld;
+    const int nsb = b.k / 32;
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+    for (int kb = lane; kb < nsb; kb += 32) {
+        Sub s;
+        if constexpr (T == kQ6_K) decode_q6k_fast(w, kb, s);
+        else decode<T>(w, kb, nullptr, s);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (c < b.ncol) {
+                const int4* xp = (const int4*) (b.xq + (size_t) c * b.k + (size_t) kb * 32);
+                acc[c] = fmaf(b.xd[(size_t) c * nsb + kb], sub_dot<T, kMinMV>(s, xp[0], xp[1]), acc[c]);
+            }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c)
+        if (c < b.ncol) {
+            const float v = warp_sum(acc[c]);
+            if (lane == 0) b.y[c * b.ycs + row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
+        }
+}
 template <int T, int NC, bool WIDE = false>
 __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
     pdl_wait();
@@ -2237,7 +2315,7 @@ static bool mv_heads_reg_launch(const MvJob& b, int H, size_t ws, size_t xs, siz
 }
 #endif
 template <int T>
-void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s, bool wide = false) {
+void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s, bool wide = false, bool fast = false) {
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
 #if !defined(MAYA_USE_HIP)
     if constexpr (T == kQ8_0)
@@ -2259,6 +2337,23 @@ void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s, bool wid
             else pdl_launch(mv_kernel<T, 16, true>, grid, kThreads, 0, s, J);
             return;
         }
+    if constexpr (T == kQ6_K || T == kQ5_K) {
+        if (fast) {
+            bool ok2 = true;
+            for (int i = 0; i < nj; ++i) ok2 = ok2 && ((uintptr_t) J.j[i].w & 1u) == 0 && (J.j[i].ld & 1) == 0;
+            if (ok2) {
+                if (max_c <= 1) pdl_launch(mv_fast_kernel<T, 1>, grid, kThreads, 0, s, J);
+                else if (max_c == 2) pdl_launch(mv_fast_kernel<T, 2>, grid, kThreads, 0, s, J);
+                else if (max_c == 3) pdl_launch(mv_fast_kernel<T, 3>, grid, kThreads, 0, s, J);
+                else if (max_c == 4) pdl_launch(mv_fast_kernel<T, 4>, grid, kThreads, 0, s, J);
+                else if (max_c == 5) pdl_launch(mv_fast_kernel<T, 5>, grid, kThreads, 0, s, J);
+                else if (max_c == 6) pdl_launch(mv_fast_kernel<T, 6>, grid, kThreads, 0, s, J);
+                else if (max_c <= 8) pdl_launch(mv_fast_kernel<T, 8>, grid, kThreads, 0, s, J);
+                else pdl_launch(mv_fast_kernel<T, 16>, grid, kThreads, 0, s, J);
+                return;
+            }
+        }
+    }
     if (max_c <= 1) pdl_launch(mv_kernel<T, 1>, grid, kThreads, 0, s, J);
     else if (max_c <= 4) pdl_launch(mv_kernel<T, 4>, grid, kThreads, 0, s, J);
     else if (max_c <= 5 && mv56()) pdl_launch(mv_kernel<T, 5>, grid, kThreads, 0, s, J);
@@ -2956,7 +3051,7 @@ bool set_down(const SetArgs& a, cudaStream_t s) {
     return true;
 }
 
-bool mv(const MvJob* jobs, int n, cudaStream_t s) {
+bool mv(const MvJob* jobs, int n, cudaStream_t s, bool fast) {
     // the jobs by type, up to kMaxJobs a launch
     bool done[64] = {};
     if (n > 64) return false;
@@ -2976,7 +3071,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
                 max_c = std::max(max_c, jobs[k].ncol);
                 done[k] = true;
             }
-#define MV_(T) mv_nc<T>(J, nj, max_n, max_c, s, wide)
+#define MV_(T) mv_nc<T>(J, nj, max_n, max_c, s, wide, fast)
             DS4_IQ_SWITCH_MV(t, MV_)
 #undef MV_
         }
