@@ -6135,7 +6135,7 @@ struct Model::Impl {
         if (pool != nullptr) {   // (the readers' pool runs items on the device's own thread too: its device kept)
             int cur = 0;
             const bool got = cudaGetDevice(&cur) == cudaSuccess;
-            const bool copied = helper_copy(hlp[0].id, si, pool, l.blob);
+            const bool copied = helper_copy(hlp[l.hown.empty() ? 0 : (size_t) l.hown[(size_t) e]].id, si, pool, l.blob);
             if (!got || cudaSetDevice(cur) != cudaSuccess || !copied) return false;
             if (l.nm > 1) {
                 thread_local std::vector<uint8_t> half;
@@ -6741,7 +6741,7 @@ struct Model::Impl {
                         j.left = &it.left;
                         j.bad = &it.bad;
                         j.dmem = it.hsrc + l.lay.trellis[r] + mx_read_off(l, it.mi, r);
-                        j.ddev = hlp[0].id;
+                        j.ddev = hlp[l.hown.empty() ? 0 : (size_t) l.hown[(size_t) it.e]].id;   // (several helpers: the expert's own)
                         if (r == 2 && it.dpart) {   // (DS4_FLOW_DOWN_PART: the member's columns, where copied)
                             down_cut(l, it.mi, j.cpitch, j.coff, j.clen);
                             j.crows = (size_t) g.dim;
@@ -14809,8 +14809,8 @@ struct Model::Impl {
             err = "DS4_HELPER_SHARED: requires EXL3, TP2 and loaded DSpark blocks";
             return false;
         }
-        if (nh > 1 && (helper_shared || flow_helper)) {
-            err = "DS4_HELPER: several GPUs: not with DS4_HELPER_SHARED or DS4_FLOW_HELPER";
+        if (nh > 1 && helper_shared) {
+            err = "DS4_HELPER: several GPUs: not with DS4_HELPER_SHARED";
             return false;
         }
         for (const long id : idl) {
