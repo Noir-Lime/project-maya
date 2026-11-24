@@ -1235,11 +1235,15 @@ struct Model::Impl {
         PathFlowCalibration flow;
         double win_s = 0;                                              // windows: seconds a window took, so far
         int64_t win_n = 0;
+        double win_k = 1.0;                                            // predicted window time multiplier
+        int64_t win_k_n = 0;
         int last_cls = 0, last_nw = 0;                                 // the last pick's size class, its windows
-        double m = 1;                                                  // the picks' spread, against the profile's
+        double m = 0.50;                                               // the picks' spread, against the profile's
         int64_t n_m = 0;
         int last = -1;                                                 // the last pick: 1 the flow, 0 windows
         double last_pred = 0;                                          // its prediction (s, before its k)
+        double cpu_wide = 0, dev0_bw = 0, dma_ram = 0;                 // DRAM-scale CPU BW, trunk GPU BW, pipelined H2D BW
+        std::array<double, 8> hlp_bw{}, hlp_d2h{};                     // per-helper compute BW & D2H BW
     } pm;
     // DS4_PROMPT_PICK=length (opt-in until measured; =length:N from N tokens): the path by the prompt's length alone -
     // the chunked pass from kPromptFlowMin (96) tokens, windows of 16 below (ds4_prompt_mem.hpp).  The timing pick
@@ -20626,6 +20630,111 @@ struct Model::Impl {
             pm.cpu = bytes / std::max(1e-3, t_warm / 1000.0);
             if (first > 0 || (int) cold.size() >= n_cpu) pm.cpu_cold = bytes / std::max(1e-3, t_first / 1000.0);
         }
+        {
+            int prev_dev = 0;
+            cudaGetDevice(&prev_dev);
+            auto dev_bw = [](int cid, double frac, double fallback) {
+                int khz = 0, bits = 0;
+                if (cudaDeviceGetAttribute(&khz, cudaDevAttrMemoryClockRate, cid) == cudaSuccess &&
+                    cudaDeviceGetAttribute(&bits, cudaDevAttrGlobalMemoryBusWidth, cid) == cudaSuccess && khz > 0 &&
+                    bits > 0)
+                    return frac * 2.0 * (double) khz * 1e3 * ((double) bits / 8.0);
+                return fallback;
+            };
+            pm.dev0_bw = dev_bw(devs[0].id, 0.70, 1200e9);
+            for (size_t hi = 0; hi < hlp.size() && hi < pm.hlp_bw.size(); ++hi) {
+                const HelperCtx& H = hlp[hi];
+                pm.hlp_bw[hi] = dev_bw(H.id, 0.35, 300e9);
+                double d2h = std::min(pm.copy, pm.dma) * 0.75;
+                if (c.stage != nullptr && H.pool != nullptr && H.used > 0) {
+                    const size_t nb_h = std::min({(size_t) (16 << 20), H.used, (size_t) c.S * c.stage_stride});
+                    if (nb_h >= 4096 && cudaSetDevice(H.id) == cudaSuccess) {
+                        for (int rep = 0; rep < 2; ++rep) {
+                            const double a = now_ms();
+                            if (cudaMemcpyAsync(c.stage, H.pool, nb_h, cudaMemcpyDeviceToHost, H.st) == cudaSuccess &&
+                                cudaStreamSynchronize(H.st) == cudaSuccess) {
+                                if (rep == 1) d2h = (double) nb_h / std::max(1e-4, (now_ms() - a) / 1000.0);
+                            } else {
+                                cudaGetLastError();
+                                break;
+                            }
+                        }
+                    }
+                }
+                pm.hlp_d2h[hi] = d2h;
+            }
+            cudaSetDevice(prev_dev);
+            // Measure CPU lane on >= 40 distinct RAM experts (exceeding L3 cache) across 5 trunk layers
+            struct WideLayer {
+                int il;
+                std::vector<Ent> ents;
+                double bytes;
+            };
+            std::vector<WideLayer> wls;
+            double wide_bytes = 0;
+            const int step_il = std::max(1, g.nl / 5);
+            for (int il = 0; il < g.nl && (int) wls.size() < 5; il += step_il) {
+                const Layer& wl = L[(size_t) il];
+                WideLayer item{il, {}, 0};
+                for (int pass = 0; pass < 2 && (int) item.ents.size() < 8; ++pass) {
+                    for (int e = 0; e < wl.n_exp && (int) item.ents.size() < 8; ++e) {
+                        if (wl.slot[(size_t) e] >= 0) continue;
+                        if (!wl.helper.empty() && wl.helper[(size_t) e] != nullptr) continue;
+                        const bool has_ram = !wl.ram.empty() && wl.ram[(size_t) e] >= 0;
+                        if (pass == 0 && !has_ram) continue;
+                        if (pass == 1 && has_ram) continue;
+                        Ent en;
+                        en.e = e;
+                        en.n = 1;
+                        en.slot0 = (int) item.ents.size();
+                        en.tok[0] = 0;
+                        item.ents.push_back(en);
+                        item.bytes += (double) wl.blob;
+                    }
+                }
+                if ((int) item.ents.size() == 8) {
+                    wide_bytes += item.bytes;
+                    wls.push_back(std::move(item));
+                }
+            }
+            if (!wls.empty()) {
+                std::vector<float> xw((size_t) g.dim);
+                for (size_t i = 0; i < xw.size(); ++i) xw[i] = 0.02f * std::sin(0.37f * (float) i);
+                for (int rep = 0; rep < 2; ++rep) {
+                    const double a = now_ms();
+                    for (const auto& item : wls) cpu_experts(L[(size_t) item.il], xw.data(), item.ents, (size_t) g.dim);
+                    const double dt = now_ms() - a;
+                    if (rep == 1) pm.cpu_wide = wide_bytes / std::max(1e-4, dt / 1000.0);
+                }
+            }
+            // Pipelined streaming H2D probe matching copy_streamed 3-matrix chunks
+            {
+                const size_t slot_b = std::min(c.ring_stride, c.stage_stride);
+                if (slot_b > 0 && c.S >= 1 && c.ring_n >= 8 && cudaSetDevice(d.id) == cudaSuccess) {
+                    const int n_pip = 16;
+                    const size_t p0 = slot_b / 3, p1 = slot_b / 3, p2 = slot_b - p0 - p1;
+                    for (int rep = 0; rep < 2; ++rep) {
+                        const double a = now_ms();
+                        for (int k = 0; k < n_pip; ++k) {
+                            const uint8_t* src = (const uint8_t*) c.stage + (size_t) (k % c.S) * c.stage_stride;
+                            uint8_t* dst = (uint8_t*) c.ring + (size_t) (k % c.ring_n) * c.ring_stride;
+                            cudaMemcpyAsync(dst, src, p0, cudaMemcpyHostToDevice, c.cs);
+                            cudaMemcpyAsync(dst + p0, src + p0, p1, cudaMemcpyHostToDevice, c.cs);
+                            cudaMemcpyAsync(dst + p0 + p1, src + p0 + p1, p2, cudaMemcpyHostToDevice, c.cs);
+                        }
+                        if (cudaStreamSynchronize(c.cs) == cudaSuccess && rep == 1)
+                            pm.dma_ram = (double) ((size_t) n_pip * slot_b) / std::max(1e-4, (now_ms() - a) / 1000.0);
+                    }
+                }
+            }
+            if (pm.dma_ram <= 0) pm.dma_ram = pm.dma;
+            if (pm.cpu_wide <= 0) pm.cpu_wide = pm.cpu;
+            std::fprintf(stderr, "ds4 pick_path cal: cpu_fast=%.1f GB/s cpu_wide=%.1f GB/s dma=%.1f dma_ram=%.1f GB/s dev0_bw=%.0f GB/s",
+                         pm.cpu / 1e9, pm.cpu_wide / 1e9, pm.dma / 1e9, pm.dma_ram / 1e9, pm.dev0_bw / 1e9);
+            for (size_t hi = 0; hi < hlp.size() && hi < pm.hlp_bw.size(); ++hi)
+                std::fprintf(stderr, " h%zu_bw=%.0f/d2h=%.1f", hi, pm.hlp_bw[hi] / 1e9, pm.hlp_d2h[hi] / 1e9);
+            std::fprintf(stderr, "\n");
+        }
         pm.on = pm.dma > 0 && pm.copy > 0 && pm.cpu > 0;
         if (o.verbose) {
             char dk[32] = "not measured", cc[32] = "not measured";
@@ -20640,33 +20749,41 @@ struct Model::Impl {
     // layer l's CPU-lane experts (VRAM holds the rest) and the chance a token picks a given one of them: the profile's
     // share of the layer's picks they took, spread evenly over them, times pm.m (what the flow's runs found)
     double pm_rate(const Layer& l, int& n_cold) const {
-        const uint32_t* pr = prof.data() + (size_t) l.il * g.n_exp;
+        const uint32_t* pr = prof.empty() ? nullptr : prof.data() + (size_t) l.il * g.n_exp;
         double sum = 0, cold = 0;
         n_cold = 0;
         for (int e = 0; e < l.n_exp; ++e) {
-            sum += pr[e];
-            if (l.slot[(size_t) e] < 0) cold += pr[e], ++n_cold;
+            const double p = pr != nullptr ? (double) pr[e] : 1.0;
+            sum += p;
+            if (l.slot[(size_t) e] < 0) cold += p, ++n_cold;
         }
         if (n_cold == 0) return 0.0;
         const double share = sum > 0 && cold > 0 ? cold / sum : (double) n_cold / l.n_exp;
         return pm.m * (double) l.k_exp * share / n_cold;
     }
-    // the CPU-lane experts n tokens pick in the trunk's layers, expected (each layer's n_cold (1 - e^(-rate n)))
+    // the off-trunk experts n tokens pick across the trunk's layers using the per-expert routing profile
     double pm_picks(int n) const {
         double d = 0;
         for (int il = 0; il < g.nl; ++il) {
-            int nc = 0;
-            const double a = pm_rate(L[(size_t) il], nc);
-            d += nc * (1.0 - std::exp(-a * n));
+            if (front_only && away(il)) continue;
+            const Layer& l = L[(size_t) il];
+            const uint32_t* pr = prof.empty() ? nullptr : prof.data() + (size_t) l.il * g.n_exp;
+            double sum = 0;
+            if (pr != nullptr)
+                for (int e = 0; e < l.n_exp; ++e) sum += (double) pr[e];
+            for (int e = 0; e < l.n_exp; ++e) {
+                if (l.slot[(size_t) e] >= 0) continue;
+                const double pe = sum > 0 && pr != nullptr ? (double) pr[e] / sum : 1.0 / std::max(1, l.n_exp);
+                d += 1.0 - std::exp(-pm.m * (double) l.k_exp * (double) n * pe);
+            }
         }
         return d;
     }
-    // a run of one chunk of n tokens on the flow picked `picked` CPU-lane experts: pm.m to what makes the expectation
-    // that (bisection over its log; a running mean of the log)
+    // a run of one chunk of n tokens on the flow picked `picked` off-trunk experts: fit pm.m by bisection
     void pm_learn(int n, double picked) {
         if (!pm.on || n < 2 || picked < 1) return;
         const double m0 = pm.m;
-        double lo = std::log(1e-3), hi = std::log(1e3);
+        double lo = std::log(1e-3), hi = std::log(1e2);
         for (int it = 0; it < 40; ++it) {
             pm.m = std::exp(0.5 * (lo + hi));
             (pm_picks(n) < picked ? lo : hi) = 0.5 * (lo + hi);
@@ -20675,60 +20792,134 @@ struct Model::Impl {
         pm.m = std::exp(pm.n_m == 0 ? obs : 0.7 * std::log(m0) + 0.3 * obs);
         ++pm.n_m;
     }
-    // a prompt of n tokens that the flow could take (n >= chunk_min): true the flow, false windows of 16 - each path's
-    // time predicted from the bytes of CPU-lane experts it would move (the flow: each picked one once, n_cold (1 -
-    // e^(-rate n)) a layer, pm_rate) or compute (windows: each window's own picks), those in RAM (each layer's share:
-    // sampled pages of up to 32 of its CPU-lane experts, mincore / QueryWorkingSetEx; the RAM tier's) and those not at
-    // this PC's speeds - the flow's times what it really took against its predictions so far for prompts of that size
-    // (pm_k), windows' once some ran what a window took times the windows; the flow unless windows are predicted
-    // faster (by half, with less than kPickRes in RAM); said with --verbose
-    // --no-expert-cache (pinned placement, for repeatable answers): always the flow - the choice goes by this run's
-    // timings, what earlier prompts took and what the page cache holds, and the two paths round differently, so the
-    // same prompt would give other logits after other requests than in a fresh process
+    // a prompt of n tokens that the flow could take (n >= chunk_min): true the flow, false windows of 16, modeling
+    // VRAM slots, helper GPUs (including HR slots vs static helpers), RAM tier, DRAM-scale CPU lane, and disk
     bool pick_path(int n) {
         pm.last = -1;
         if (pick_len > 0) return prompt_by_length(n, pick_len);   // (DS4_PROMPT_PICK=length)
         if (!pm.on || n >= kPickMax || !o.expert_cache) return true;
-        double f_res = 0, f_cold = 0, w = 0;
         const int nw = n / kWin, rem = n % kWin;
+        const int n_win = (n + kWin - 1) / kWin;
+        const double ctx_scale = std::min(262144.0, (double) pos) / 200000.0;
+        const double r_dma = pm.dma_ram > 0 ? pm.dma_ram : pm.dma;
+        const double r_ram = (cp_dma && ram_pinned) ? r_dma : std::min(pm.copy, r_dma);
+        const double r_fc = pm.disk > 0 ? std::min(pm.disk, pm.dma) : std::min(pm.copy, pm.dma);
+        const double r_cpu = pm.cpu_wide > 0 ? pm.cpu_wide : pm.cpu;
+        const double r_wc = pm.cpu_cold > 0 ? pm.cpu_cold : 1.0 / (1.0 / r_fc + 1.0 / r_cpu);
+        const double bw_dev0 = pm.dev0_bw > 0 ? pm.dev0_bw : 1200e9;
+
+        double f_ram = 0, f_cold = 0, f_hlp_tot = 0;
+        std::array<double, 8> f_hlp{};
+        double win_full = 0, win_rem = 0;
+        const bool need_full = nw > 0, need_rem = rem > 0;
+
         for (int il = 0; il < g.nl; ++il) {
-            // (MAYA_MIXED_FRONT: the other GPU's layers never run here - their experts in RAM or not must not pick
-            //  this front's path: that made a short prompt's reading, and so its answer, hang on the page cache)
             if (front_only && away(il)) continue;
             const Layer& l = L[(size_t) il];
-            int nc = 0;
-            const double a = pm_rate(l, nc);
-            if (nc == 0) continue;
+            const uint32_t* pr = prof.empty() ? nullptr : prof.data() + (size_t) l.il * g.n_exp;
+            double sum_pr = 0;
+            if (pr != nullptr)
+                for (int e = 0; e < l.n_exp; ++e) sum_pr += (double) pr[e];
+
+            // Sample RAM residency only across true CPU-lane experts (not VRAM, not static helper, not HR)
+            int n_cpu_e = 0;
+            for (int e = 0; e < l.n_exp; ++e)
+                if (l.slot[(size_t) e] < 0 && (l.helper.empty() || l.helper[(size_t) e] == nullptr)) ++n_cpu_e;
             int sampled = 0, res = 0, seen = 0;
-            const int step = std::max(1, nc / 32);
+            const int step = std::max(1, n_cpu_e / 32);
             for (int e = 0; e < l.n_exp; ++e) {
-                if (l.slot[(size_t) e] >= 0 || seen++ % step != 0) continue;
+                if (l.slot[(size_t) e] >= 0) continue;
+                if (!l.helper.empty() && l.helper[(size_t) e] != nullptr) continue;
+                if (seen++ % step != 0) continue;
                 bool r = !l.ram.empty() && l.ram[(size_t) e] >= 0;
                 if (!r) {
                     r = true;
-                    for (int p = 0; p < 3 && r; ++p) r = os::resident_sampled(mx_mat(l, e, p), mx_part_bytes(l, p), 2);
+                    for (int p = 0; p < 3 && r; ++p)
+                        r = os::resident_sampled(mx_mat(l, e, p), mx_part_bytes(l, p), 2);
                 }
                 ++sampled;
                 res += r;
             }
-            const double share = sampled > 0 ? (double) res / sampled : 0.0, b = (double) l.blob;
-            auto u = [&](int t) { return nc * (1.0 - std::exp(-a * t)); };
-            f_res += share * u(n) * b;
-            f_cold += (1.0 - share) * u(n) * b;
-            w += ((double) nw * u(kWin) + (rem > 0 ? u(rem) : 0.0)) * b;
+            const double cpu_ram_share = n_cpu_e == 0 ? 1.0 : (sampled > 0 ? (double) res / sampled : 0.0);
+            const double b = (double) l.blob;
+            auto prob_e = [&](int e) {
+                return sum_pr > 0 && pr != nullptr ? (double) pr[e] / sum_pr : 1.0 / std::max(1, l.n_exp);
+            };
+
+            // Flow bytes: HR slots with l.ram >= 0 stream from RAM; static helpers stream D2H->H2D
+            double fw_vram_f = 0, fw_cpu_f = 0;
+            std::array<double, 8> fw_hlp_f{};
+            double rw_vram_f = 0, rw_cpu_f = 0;
+            std::array<double, 8> rw_hlp_f{};
+
+            for (int e = 0; e < l.n_exp; ++e) {
+                const double pe = prob_e(e);
+                const double rate = pm.m * (double) l.k_exp * pe;
+                const bool in_vram = l.slot[(size_t) e] >= 0;
+                const bool has_hlp = !l.helper.empty() && l.helper[(size_t) e] != nullptr;
+                const int hidx = has_hlp && !l.hown.empty() ? std::min(7, std::max(0, (int) l.hown[(size_t) e])) : 0;
+                const bool is_hr = has_hlp && !l.hr_slot.empty() && l.hr_slot[(size_t) e] >= 0;
+                const bool in_ram = !l.ram.empty() && l.ram[(size_t) e] >= 0;
+
+                if (!in_vram) {
+                    const double un = 1.0 - std::exp(-rate * (double) n);
+                    const double bn = un * b;
+                    if (in_ram) {
+                        f_ram += bn;
+                    } else if (has_hlp && !is_hr) {
+                        f_hlp[(size_t) hidx] += bn;
+                        f_hlp_tot += bn;
+                    } else if (cpu_ram_share > 0 && !has_hlp) {
+                        f_ram += cpu_ram_share * bn;
+                        f_cold += (1.0 - cpu_ram_share) * bn;
+                    } else {
+                        f_cold += bn;
+                    }
+                }
+                if (need_full) {
+                    const double bw_f = (1.0 - std::exp(-rate * (double) kWin)) * b;
+                    if (in_vram) fw_vram_f += bw_f;
+                    else if (has_hlp) fw_hlp_f[(size_t) hidx] += bw_f;
+                    else fw_cpu_f += bw_f;
+                }
+                if (need_rem) {
+                    const double bw_r = (1.0 - std::exp(-rate * (double) rem)) * b;
+                    if (in_vram) rw_vram_f += bw_r;
+                    else if (has_hlp) rw_hlp_f[(size_t) hidx] += bw_r;
+                    else rw_cpu_f += bw_r;
+                }
+            }
+
+            auto layer_win_cost = [&](int Tw, double v_b, const std::array<double, 8>& hb, double c_b) {
+                const double t_vram = v_b > 0 ? 0.00006 + v_b / bw_dev0 : 0.0;
+                double thlp = 0.0;
+                for (size_t hi = 0; hi < hlp.size() && hi < hb.size(); ++hi) {
+                    if (hb[hi] <= 0) continue;
+                    const double hbw = pm.hlp_bw[hi] > 0 ? pm.hlp_bw[hi] : 300e9;
+                    thlp = std::max(thlp, 0.00002 + hb[hi] / hbw);
+                }
+                const double tcpu = (cpu_ram_share * c_b) / r_cpu + ((1.0 - cpu_ram_share) * c_b) / r_wc;
+                const double tattn = 0.00020 + 0.000018 * (double) Tw + 0.000004 * (double) Tw * ctx_scale;
+                return tattn + std::max({t_vram, thlp, tcpu});
+            };
+            if (need_full) win_full += layer_win_cost(kWin, fw_vram_f, fw_hlp_f, fw_cpu_f);
+            if (need_rem) win_rem += layer_win_cost(rem, rw_vram_f, rw_hlp_f, rw_cpu_f);
         }
-        const double r_fr = std::min(pm.copy, pm.dma), r_fc = pm.disk > 0 ? std::min(pm.disk, pm.dma) : r_fr;
-        const double r_wc = pm.cpu_cold > 0 ? pm.cpu_cold : 1.0 / (1.0 / r_fc + 1.0 / pm.cpu);
-        const double t_flow = f_res / r_fr + f_cold / r_fc;
-        const double t_win = std::max(0.0, w - f_cold) / pm.cpu + f_cold / r_wc;
-        const int cls = pm_cls(n), n_win = (n + kWin - 1) / kWin;
-        // (windows: once some ran, what a window took on average times the windows the prompt needs - each pays the
-        // fixed costs of every layer on every GPU again, which a pass of the flow pays once)
-        const double pf = pm_k(cls) * t_flow, pw = pm.win_n > 0 ? pm.win_s * n_win : t_win;
-        // (the flow unless windows are predicted faster - in half its time at least, unless kPickRes of the CPU-lane
-        // experts' bytes are in RAM: the flow wins on every PC whose experts come from an SSD, where a wrong pick would
-        // cost the most; windows win where they are all in RAM)
-        const double res_share = f_res / std::max(1.0, f_res + f_cold);
+
+        double hlp_hol = 0.0;
+        for (size_t hi = 0; hi < hlp.size() && hi < f_hlp.size(); ++hi) {
+            if (f_hlp[hi] <= 0) continue;
+            const double d2h = pm.hlp_d2h[hi] > 0 ? pm.hlp_d2h[hi] : std::min(pm.copy, pm.dma);
+            hlp_hol = std::max(hlp_hol, f_hlp[hi] / d2h);
+        }
+        const double t_attn_flow = (double) g.nl * 0.00018 + (0.00015 + 0.00012 * ctx_scale) * (double) n;
+        const double t_flow = f_ram / r_ram + (f_hlp_tot + f_cold) / r_dma + 0.25 * hlp_hol +
+                              std::max(0.0, f_cold / r_fc - f_cold / r_dma) + t_attn_flow;
+        const double t_win = (double) nw * win_full + (need_rem ? win_rem : 0.0);
+
+        const int cls = pm_cls(n);
+        const double pf = pm_k(cls) * t_flow, pw = pm.win_k * t_win;
+        const double res_share = (f_ram + f_hlp_tot) / std::max(1.0, f_ram + f_hlp_tot + f_cold);
         const bool flow = should_use_flow_path(pf, pw, res_share, kPickRes);
         pm.last = flow ? 1 : 0;
         pm.last_cls = cls;
@@ -20736,10 +20927,10 @@ struct Model::Impl {
         pm.last_pred = flow ? t_flow : t_win;
         if (o.verbose)
             std::fprintf(stderr,
-                         "ds4: a prompt of %d tokens through %s: predicted %.2f s, %s %.2f s (%.0f%% of its CPU-lane "
-                         "experts' %.1f GB in RAM)\n",
+                         "ds4: a prompt of %d tokens through %s: predicted %.2f s, %s %.2f s (%.0f%% resident across "
+                         "RAM+helpers, %.1f GB streamed)\n",
                          n, flow ? "the flow" : "windows", flow ? pf : pw, flow ? "windows" : "the flow", flow ? pw : pf,
-                         100.0 * res_share, (f_res + f_cold) / 1e9);
+                         100.0 * res_share, (f_ram + f_hlp_tot + f_cold) / 1e9);
         return flow;
     }
     // a prompt's size class for pm.flow: 2-31, 32-127, 128-511, 512 tokens and more
@@ -20777,9 +20968,9 @@ struct Model::Impl {
     void path_done(double ms) {
         if (pm.last < 0 || pm.last_pred <= 0) return;
         if (pm.last == 0) {
-            const double w = ms / 1000.0 / std::max(1, pm.last_nw);
-            pm.win_s = pm.win_n == 0 ? w : 0.7 * pm.win_s + 0.3 * w;
-            ++pm.win_n;
+            const double ratio = std::min(2.5, std::max(0.4, (ms / 1000.0) / pm.last_pred));
+            pm.win_k = pm.win_k_n == 0 ? ratio : 0.7 * pm.win_k + 0.3 * ratio;
+            ++pm.win_k_n;
         } else {
             pm.flow.observe_size_class(pm.last_cls, ms / 1000.0 / pm.last_pred);
         }
