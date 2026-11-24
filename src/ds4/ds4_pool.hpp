@@ -76,6 +76,8 @@ public:
             cv_.notify_all();
         }
     }
+    /// the participant running the current job (work_affine's: worker i = i, the caller size() - 1; -1 elsewhere)
+    static int part() { return tl_part_; }
     /// (DS4_LANE_AFFINE) start() with ownership: participant p (worker i = p, the caller size() - 1) takes the jobs j
     /// with owner(j) == p first, by a ticket of its own, then the others' (p + 1, p + 2, ..: its neighbours first)
     void start_affine(int n, const std::function<void(int)>& fn, const std::function<int(int)>& owner) {
@@ -123,6 +125,7 @@ public:
 private:
     void work_affine(uint64_t g, int me) {
         const int W = size();
+        tl_part_ = me;
         for (int k = 0; k < W; ++k) {
             const int q = (me + k) % W;
             for (;;) {
@@ -186,6 +189,7 @@ private:
     PartTicket pt_[kMaxPart];
     std::vector<int> perm_, base_, cnt_, own_, fill_;
     std::atomic<bool> affine_{false};
+    static inline thread_local int tl_part_ = -1;
     std::atomic<int> sleeping_{0};
     std::atomic<bool> quit_{false};
     std::mutex mu_;

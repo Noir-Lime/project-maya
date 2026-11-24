@@ -11568,6 +11568,86 @@ struct Model::Impl {
         }();
         return on && NH == 1 && pools.size() == 1;
     }
+    // (DS4_LANE_WARM=1, with DS4_LANE_AFFINE=1) between the lane's calls: the guessed next layer's RAM-tier CPU-lane
+    // experts read by each participant - its own rows (run_affine's shares) - so its call finds them in its caches
+    static bool lane_warm_env() {
+        static const bool on = [] {
+            const char* v = ds4_env("DS4_LANE_WARM");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        return on;
+    }
+    bool lane_warm_on() const { return lane_warm_env() && lane_affine(); }
+    static bool warm_ram(const Layer& n, int e) {   // (a CPU-lane expert copied into RAM: not in VRAM, not a helper's)
+        return n.slot[(size_t) e] < 0 && !n.ram.empty() && n.ram[(size_t) e] >= 0 &&
+               (n.helper.empty() || n.helper[(size_t) e] == nullptr);
+    }
+    std::vector<int> warm_e;
+    std::function<void(int)> warm_fn;
+    std::atomic<uint64_t> warm_sink{0}, warm_done{0}, warm_plan{0};
+    uint64_t warm_calls = 0, warm_late = 0, warm_experts = 0;
+    void warm_share(const Layer& n, int p, int W, const volatile unsigned* stop, unsigned want) {
+        uint64_t acc = 0, lines = 0, plan = 0;
+        for (int e : warm_e)
+            for (int r = 0; r < 3; ++r) {
+                const int rows = mx_n(r);
+                plan += ((size_t) ((int64_t) rows * (p + 1) / W - (int64_t) rows * p / W) * mx_row_b(n, r) + 63) / 64;
+            }
+        for (int e : warm_e)
+            for (int r = 0; r < 3; ++r) {
+                const size_t rb = mx_row_b(n, r);
+                const int rows = mx_n(r);
+                const int a = (int) ((int64_t) rows * p / W), b = (int) ((int64_t) rows * (p + 1) / W);
+                const uint8_t* s = mx_part_ptr(n, e, r, 0) + (size_t) a * rb;
+                const size_t len = (size_t) (b - a) * rb;
+                for (size_t o = 0; o < len; o += 64) {
+                    acc += *(const volatile uint8_t*) (s + o);
+                    if ((++lines & 63) == 0 && *stop == want) {   // (the next request: stop)
+                        warm_sink.fetch_xor(acc, std::memory_order_relaxed);
+                        warm_done.fetch_add(lines, std::memory_order_relaxed);
+                        warm_plan.fetch_add(plan, std::memory_order_relaxed);
+                        return;
+                    }
+                }
+            }
+        warm_sink.fetch_xor(acc, std::memory_order_relaxed);
+        warm_done.fetch_add(lines, std::memory_order_relaxed);
+        warm_plan.fetch_add(plan, std::memory_order_relaxed);
+    }
+    void lane_warm(int li, unsigned seq) {   // (the service thread, after answering request seq of layer li)
+        const int j = li + 1;
+        if (j >= (int) L.size() || ahead_for.empty() || ahead_for[(size_t) j] != seq + 1) return;
+        const Layer& n = L[(size_t) j];
+        if (n.ram.empty() || (int) n.slot.size() < n.n_exp) return;
+        const uint8_t* fl = ahead_fl.data() + (size_t) j * 1024;
+        const uint8_t* rk = ahead_rank.data() + (size_t) j * 1024;
+        warm_e.clear();
+        for (int e = 0; e < n.n_exp && e < 1024; ++e)
+            if ((fl[e] & 2) && warm_ram(n, e)) warm_e.push_back(e);
+        if (warm_e.empty()) return;
+        std::sort(warm_e.begin(), warm_e.end(), [rk](int a, int b) { return rk[a] != rk[b] ? rk[a] < rk[b] : a < b; });
+        const volatile unsigned* stop = &reqs[(seq + 1) % kRing].seq;
+        ++warm_calls;
+        if (*stop == seq + 1) {   // (the next request is here already)
+            ++warm_late;
+            return;
+        }
+        warm_experts += warm_e.size();
+        const int W = pools[0]->size();
+        warm_fn = [this, &n, stop, seq, W](int p) {
+            if (Pool::part() != p) return;   // (a stolen share: its owner's caches, not this thread's)
+            warm_share(n, p, W, stop, seq + 1);
+        };
+        pools[0]->start_affine(W, warm_fn, [](int q) { return q; });
+        pools[0]->help();
+        pools[0]->wait();
+        static const bool stats = std::getenv("DS4_LANE_WARM_STATS") != nullptr;
+        if (stats && (warm_calls & 8191) == 0)
+            std::fprintf(stderr, "LANEWARM calls=%llu late=%llu experts=%llu lines_plan=%llu lines_done=%llu\n",
+                         (unsigned long long) warm_calls, (unsigned long long) warm_late,
+                         (unsigned long long) warm_experts, (unsigned long long) warm_plan.load(),
+                         (unsigned long long) warm_done.load());
+    }
     void run_affine(int n, const std::function<void(int)>& f, int per, int rows_job, int rows) {
         const int W = pools[0]->size();
         pools[0]->start_affine(n, f, [&](int j) { return (int) ((int64_t) (j % per) * rows_job * W / rows); });
@@ -13096,11 +13176,12 @@ struct Model::Impl {
         const int j = l0.il + a, end = l0.mtp ? g.nl + g.n_mtp : g.nl;
         if (j >= end || j >= (int) L.size()) return nullptr;
         const Layer& n = L[(size_t) j];
-        if (n.dev != l0.dev || n.mtp != l0.mtp || !ahead_fmt(n) || n.gate_w == nullptr || n.n_exp > 1024 ||
+        const bool warm = lane_warm_on();   // (DS4_LANE_WARM: the guesses also for RAM-tier CPU-lane experts)
+        if (n.dev != l0.dev || n.mtp != l0.mtp || !(ahead_fmt(n) || warm) || n.gate_w == nullptr || n.n_exp > 1024 ||
             (int) n.slot.size() < n.n_exp)
             return nullptr;
         for (int e = 0; e < n.n_exp; ++e)
-            if (file_read(n, e)) return &n;
+            if (file_read(n, e) || (warm && warm_ram(n, e))) return &n;
         return nullptr;
     }
     // lookahead on the CPU lane: request r (layer li, seq) carries the device's guesses for the next layers - the
@@ -16283,6 +16364,7 @@ struct Model::Impl {
             std::atomic_thread_fence(std::memory_order_release);
             *(volatile unsigned*) &rp.seq = next;
             *(volatile unsigned*) lane_done = next;
+            if (li >= 0 && lane_warm_on()) lane_warm(li, next);   // (DS4_LANE_WARM: until the next request)
             ++next;
             last = std::chrono::steady_clock::now();
         }
