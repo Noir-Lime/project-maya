@@ -2120,6 +2120,77 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s, bool fast) {
     return true;
 }
 
+bool win_experts_front(const x3::WinArgs& a, cudaStream_t s) {
+    if (a.T < 1 || a.T > kMaxEnt || !mx_geometry("win_experts_front", a.k, a.n_embd, a.n_ff) || a.h == nullptr ||
+        a.part == nullptr || a.out == nullptr) {
+        std::fprintf(stderr, "ds4 gguf win_experts_front: not covered (T %d)\n", a.T);
+        return false;
+    }
+    MxArgs m = mx_args(a.lay, a.n_embd, a.n_ff, a.limit);
+    m.grp_ptr = a.grp_ptr;
+    m.grp_start = a.grp_start;
+    m.grp_ent = a.grp_ent;
+    m.n_groups = a.n_groups;
+    Scratch* sc = scratch(s);
+    if (sc == nullptr) return false;
+    m.x = a.x;
+    m.x_stride = a.x_stride;
+    m.h = a.h;
+    m.part = a.part;
+    m.xq = sc->xq;
+    m.xd = sc->xd;
+    m.hq = sc->hq;
+    m.hd = sc->hd;
+    const int groups = a.T * a.k;
+    const bool mx_gu = mx_role(a.lay, true), mx_d = mx_role(a.lay, false);
+    iq::Args ia;
+    if (!mx_gu || !mx_d) {
+        if ((!mx_gu && !iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "win_experts_front", true)) ||
+            (!mx_d && !iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "win_experts_front", false)))
+            return false;
+        ia.grp_ptr = a.grp_ptr;
+        ia.grp_start = a.grp_start;
+        ia.grp_ent = a.grp_ent;
+        ia.n_groups = a.n_groups;
+        ia.h = a.h;
+        ia.part = a.part;
+        ia.xq = sc->xq;
+        ia.xd = sc->xd;
+        ia.hq = sc->hq;
+        ia.hd = sc->hd;
+    }
+    (mx_gu ? q8_quant : iq_act_quant)(a.x, a.x_stride, a.T, a.n_embd, sc->xq, sc->xd, s);
+    if (mx_gu) launch_groups<GateUpK>(m, a.n_ff, groups, a.T, s);
+    else iq::gate_up(ia, groups, a.T, s);
+    (mx_d ? q8_quant : iq_act_quant)(a.h, (size_t) a.n_ff, a.T * 8, a.n_ff, sc->hq, sc->hd, s);
+    if (mx_d) launch_groups<DownK>(m, a.n_embd, groups, a.T, s);
+    else iq::down(ia, groups, a.T, s);
+    check("win_experts_front");
+    return true;
+}
+
+bool win_experts_back(const x3::WinArgs& a, cudaStream_t s, bool fast) {
+    if (a.wait_ptr != nullptr) pdl_launch(mx_wait_kernel, 1, 32, 0, s, a.wait_ptr, a.wait_val);
+    CombArgs c{};
+    c.plan_ptr = a.plan_ptr;
+    c.plan_w = a.plan_w;
+    c.part = a.part;
+    c.cpu_part = a.cpu_part;
+    c.cpu_stride = a.cpu_stride != 0 ? a.cpu_stride : (size_t) a.n_embd;
+    c.cpu_flag = a.cpu_flag;
+    c.cpu_picks = a.cpu_picks;
+    c.cpu_pick_stride = a.cpu_pick_stride;
+    c.cpu_pmask = a.cpu_pmask;
+    c.sh_out = a.sh_out;
+    c.out = a.out;
+    c.out_stride = a.out_stride;
+    c.k = a.k;
+    c.n_embd = a.n_embd;
+    launch_combine(c, a.T, fast, s);
+    check("win_experts_back");
+    return true;
+}
+
 namespace {
 iq::SetArgs iq_set(const x3::SetArgs& sa) {   // a set as ds4_iq's arguments (the inputs / outputs and types to fill in)
     iq::SetArgs q;
