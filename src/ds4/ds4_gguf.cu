@@ -960,6 +960,86 @@ __global__ void __launch_bounds__(128) mx_combine_kernel(const CombArgs a) {
                 s_cf ? a.cpu_part + (size_t) t * a.cpu_stride + r : nullptr,
                 a.sh_out != nullptr ? a.sh_out[(size_t) t * a.n_embd + r] : 0.0f);
 }
+template <int K>
+__global__ void __launch_bounds__(32) mx_combine_fast_kernel(const CombArgs a) {
+    pdl_wait();
+    pdl_trigger();
+    const int t = (int) blockIdx.y, lane = (int) threadIdx.x;
+    const int r4 = (int) blockIdx.x * 32 + lane;
+    const int k = K > 0 ? K : a.k;
+    int pm = 0, cf = 0;
+    if (lane == 0 && a.cpu_pmask != nullptr) pm = a.cpu_pmask[t];
+    if (lane == 1 && a.cpu_flag != nullptr) cf = a.cpu_flag[t];
+    unsigned long long lp = 0ull;
+    float lw = 0.0f;
+    if (lane < k) {
+        lp = a.plan_ptr[t * 8 + lane];
+        lw = a.plan_w[t * 8 + lane];
+    }
+    pm = __shfl_sync(0xffffffffu, pm, 0);
+    cf = __shfl_sync(0xffffffffu, cf, 1);
+    constexpr int kMax = K > 0 ? K : 8;
+    unsigned long long ptrs[kMax];
+    float ws[kMax];
+#pragma unroll
+    for (int i = 0; i < kMax; ++i) {
+        ptrs[i] = __shfl_sync(0xffffffffu, lp, i);
+        ws[i] = __shfl_sync(0xffffffffu, lw, i);
+    }
+    if (r4 * 4 >= a.n_embd) return;
+    const int n4 = a.n_embd >> 2, pcs = (int) (a.cpu_pick_stride >> 2);
+    float4 p[kMax];
+#pragma unroll
+    for (int i = 0; i < kMax; ++i) {
+        if (K > 0 || i < k) {
+            const int e = t * 8 + i;
+            if (ptrs[i] != 0ull) p[i] = ((const float4*) a.part)[(size_t) e * n4 + r4];
+            else if ((pm >> i) & 1) p[i] = ((const float4*) a.cpu_picks)[(size_t) e * pcs + r4];
+            else p[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+    }
+    const float4 cp = cf ? ((const float4*) (a.cpu_part + (size_t) t * a.cpu_stride))[r4]
+                         : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const float4 sh = a.sh_out != nullptr ? ((const float4*) a.sh_out)[(size_t) t * n4 + r4]
+                                          : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float mx = 0.0f, my = 0.0f, mz = 0.0f, mw = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kMax; ++i) {
+        if (K > 0 || i < k) {
+            const float wi = ws[i];
+            mx = __fmaf_rn(wi, p[i].x, mx);
+            my = __fmaf_rn(wi, p[i].y, my);
+            mz = __fmaf_rn(wi, p[i].z, mz);
+            mw = __fmaf_rn(wi, p[i].w, mw);
+        }
+    }
+    if (cf) {
+        mx = __fadd_rn(mx, cp.x);
+        my = __fadd_rn(my, cp.y);
+        mz = __fadd_rn(mz, cp.z);
+        mw = __fadd_rn(mw, cp.w);
+    }
+    float4 o;
+    o.x = __fadd_rn(mx, sh.x);
+    o.y = __fadd_rn(my, sh.y);
+    o.z = __fadd_rn(mz, sh.z);
+    o.w = __fadd_rn(mw, sh.w);
+    ((float4*) (a.out + (size_t) t * a.out_stride))[r4] = o;
+}
+static void launch_combine(const CombArgs& c, int T, bool fast, cudaStream_t s) {
+    const bool ok = fast && c.k <= 8 && (c.n_embd & 3) == 0 && (c.out_stride & 3) == 0 &&
+                    (((uintptr_t) c.part | (uintptr_t) c.out) & 15u) == 0 &&
+                    (c.sh_out == nullptr || ((uintptr_t) c.sh_out & 15u) == 0) &&
+                    (c.cpu_part == nullptr || ((((uintptr_t) c.cpu_part & 15u) == 0) && (c.cpu_stride & 3) == 0)) &&
+                    (c.cpu_picks == nullptr ||
+                     ((((uintptr_t) c.cpu_picks & 15u) == 0) && (c.cpu_pick_stride & 3) == 0));
+    if (ok && c.k == 6)
+        pdl_launch(mx_combine_fast_kernel<6>, dim3((unsigned) ((c.n_embd / 4 + 31) / 32), (unsigned) T), 32, 0, s, c);
+    else if (ok)
+        pdl_launch(mx_combine_fast_kernel<0>, dim3((unsigned) ((c.n_embd / 4 + 31) / 32), (unsigned) T), 32, 0, s, c);
+    else
+        pdl_launch(mx_combine_kernel, dim3((unsigned) ((c.n_embd + 127) / 128), (unsigned) T), 128, 0, s, c);
+}
 
 __global__ void mx_wait_kernel(const unsigned* p, unsigned v) {
     pdl_wait();
@@ -1931,7 +2011,7 @@ void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s)
     check("moe_gate_up");
 }
 
-void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s) {
+void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s, bool fast) {
     if (!mx_geometry("moe_down", a.k, a.n_embd, a.n_ff) || h == nullptr) return;
     Scratch* sc = scratch(s);
     if (sc == nullptr) return;
@@ -1969,11 +2049,11 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
     c.out_stride = (size_t) a.n_embd;
     c.k = a.k;
     c.n_embd = a.n_embd;
-    pdl_launch(mx_combine_kernel, dim3((unsigned) ((a.n_embd + 127) / 128), 1), 128, 0, s, c);
+    launch_combine(c, 1, fast, s);
     check("moe_down");
 }
 
-bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
+bool win_experts(const x3::WinArgs& a, cudaStream_t s, bool fast) {
     if (a.T < 1 || a.T > kMaxEnt || !mx_geometry("win_experts", a.k, a.n_embd, a.n_ff) || a.h == nullptr ||
         a.part == nullptr || a.out == nullptr) {
         std::fprintf(stderr, "ds4 gguf win_experts: not covered (T %d)\n", a.T);
@@ -2035,7 +2115,7 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
     c.out_stride = a.out_stride;
     c.k = a.k;
     c.n_embd = a.n_embd;
-    pdl_launch(mx_combine_kernel, dim3((unsigned) ((a.n_embd + 127) / 128), (unsigned) a.T), 128, 0, s, c);
+    launch_combine(c, a.T, fast, s);
     check("win_experts");
     return true;
 }

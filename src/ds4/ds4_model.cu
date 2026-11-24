@@ -23451,7 +23451,7 @@ struct Model::Impl {
                     ma.cpu_flag = rhd ? rh_ones : &rh_dresp->cpu[0];
                 }
                 prof_mark(d, 4);
-                if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
+                if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s, true);
                 else x3::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
             } else {   // each distinct expert read once for the window's tokens
                 // the PCIe lane (a layer that streams, ln_win): the window's experts the host streams pulled into this
@@ -23518,7 +23518,7 @@ struct Model::Impl {
                 wa.n_embd = D;
                 wa.n_ff = FF;
                 wa.limit = g.lim;
-                if (!(lay.fmt == gg::kFmtMXFP4 ? gg::win_experts(wa, s) : x3::win_experts(wa, s))) {
+                if (!(lay.fmt == gg::kFmtMXFP4 ? gg::win_experts(wa, s, true) : x3::win_experts(wa, s))) {
                     err = "exl3 win_experts failed";
                     return false;
                 }

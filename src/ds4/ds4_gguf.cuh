@@ -95,8 +95,9 @@ void rows(const x3::Mat& m, uint16_t* dst, bool bf16, cudaStream_t s);
 /// x3::moe_gate_up / moe_down / win_experts / set_gate_up / set_down for a GGUF's experts (lay.fmt == kFmtMXFP4; the
 /// roles' types in lay.gg_type, see expert_type).
 void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s);
-void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s);
-bool win_experts(const x3::WinArgs& a, cudaStream_t s);
+void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s,
+              bool fast = false);
+bool win_experts(const x3::WinArgs& a, cudaStream_t s, bool fast = false);
 void set_gate_up(const x3::SetArgs& a, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh,
                  cudaStream_t s, const uint16_t* x16 = nullptr);   // (x16: x's rows_f16, ldx apart - the low-bit tiles read it)
 void set_down(const x3::SetArgs& a, const uint16_t* h16, int ldh, float* y, int ldy, cudaStream_t s);
