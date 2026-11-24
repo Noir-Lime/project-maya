@@ -219,7 +219,7 @@ struct TopkScratch {
 };
 constexpr int kTopkSeg = 16384, kTopkSegMin = 32768, kTopkSegMax = 64;
 void topk(const float* vals, long long stride, int T, const Rows& r, const int* cand, int cand_stride, int blk,
-          int* out, int out_stride, cudaStream_t s, const TopkScratch* sc = nullptr);
+          int* out, int out_stride, cudaStream_t s, const TopkScratch* sc = nullptr, bool fast = false);
 /// Level one of the candidate pre-filter, row t: block b's score = the max over its blk positions of the r.n[t] the
 /// query sees; the block of its newest position is pinned; the top r.k[t] blocks -> out[t] (bm: scratch rows bm_stride).
 void cand_blocks(const float* score, long long stride, int T, const Rows& r, int blk, float* bm, long long bm_stride,

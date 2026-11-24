@@ -1819,6 +1819,299 @@ __global__ void __launch_bounds__(1024) topk_merge_kernel(Rows r, int P, int K, 
         out[slot] = cd != nullptr ? cd[x / blk] * blk + x % blk : x;
     });
 }
+template <int LAYOUT, int NH, class Key, class Emit>
+__device__ __forceinline__ uint32_t topk_block_fast(int n, int k, uint32_t* __restrict__ skeys, Key key, Emit emit) {
+    __shared__ unsigned hist[NH][256];
+    __shared__ uint32_t prefix_s, mask_s;
+    __shared__ int remaining_s;
+    __shared__ int wgt[32], weq[32], wsel[32];
+    __shared__ int base_gt, base_eq, base_sel;
+    const int lane = (int) threadIdx.x & 31, wp = (int) threadIdx.x >> 5, nw = (int) blockDim.x >> 5;
+    const int hid = wp & (NH - 1);
+    if (threadIdx.x == 0) {
+        prefix_s = 0u;
+        mask_s = 0u;
+        remaining_s = k;
+        base_gt = 0;
+        base_eq = 0;
+        base_sel = 0;
+    }
+#pragma unroll
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int i = (int) threadIdx.x; i < NH * 256; i += (int) blockDim.x) hist[i >> 8][i & 255] = 0u;
+        __syncthreads();
+        const uint32_t prefix = prefix_s, mask = mask_s;
+        if (shift == 24 && skeys != nullptr) {
+            for (int i = (int) threadIdx.x; i < n; i += (int) blockDim.x) {
+                const uint32_t u = key(i);
+                skeys[i] = u;
+                atomicAdd(&hist[hid][u >> 24], 1u);
+            }
+        } else if (skeys != nullptr) {
+            for (int i = (int) threadIdx.x; i < n; i += (int) blockDim.x) {
+                const uint32_t u = skeys[i];
+                if ((u & mask) == prefix) atomicAdd(&hist[hid][(u >> shift) & 0xffu], 1u);
+            }
+        } else {
+            for (int i = (int) threadIdx.x; i < n; i += (int) blockDim.x) {
+                const uint32_t u = key(i);
+                if ((u & mask) == prefix) atomicAdd(&hist[hid][(u >> shift) & 0xffu], 1u);
+            }
+        }
+        __syncthreads();
+        if constexpr (NH > 1) {
+            if (threadIdx.x < 256) {
+                unsigned s = hist[0][threadIdx.x];
+#pragma unroll
+                for (int c = 1; c < NH; ++c) s += hist[c][threadIdx.x];
+                hist[0][threadIdx.x] = s;
+            }
+            __syncthreads();
+        }
+        if (wp == 0) {
+            const int rem = remaining_s;
+            int cum = 0;
+            bool found = false;
+            for (int b = 224; b >= 0 && !found; b -= 32) {
+                const int d = b + (31 - lane);
+                const int h = (int) hist[0][d];
+                int p = h;
+#pragma unroll
+                for (int o = 1; o < 32; o <<= 1) {
+                    const int a = __shfl_up_sync(0xffffffffu, p, o);
+                    if (lane >= o) p += a;
+                }
+                const int tot = cum + p;
+                const unsigned hit = __ballot_sync(0xffffffffu, tot >= rem);
+                if (hit != 0u) {
+                    const int win = __ffs((int) hit) - 1;
+                    if (lane == win) {
+                        prefix_s = prefix | ((uint32_t) d << shift);
+                        mask_s = mask | (0xffu << shift);
+                        remaining_s = rem - (tot - h);
+                    }
+                    found = true;
+                }
+                cum += __shfl_sync(0xffffffffu, p, 31);
+            }
+        }
+        __syncthreads();
+    }
+    const uint32_t thr = prefix_s;
+    const int remaining = remaining_s;
+    const int n_gt = k - remaining;
+    const unsigned below = (1u << lane) - 1u;
+    for (int i0 = 0; i0 < n; i0 += (int) blockDim.x) {
+        const int i = i0 + (int) threadIdx.x;
+        const uint32_t u = i < n ? (skeys != nullptr ? skeys[i] : key(i)) : 0u;
+        const bool gt = i < n && u > thr, eq = i < n && u == thr;
+        const unsigned mg = __ballot_sync(0xffffffffu, gt), me = __ballot_sync(0xffffffffu, eq);
+        if (lane == 0) {
+            if constexpr (LAYOUT == 0) wgt[wp] = __popc(mg);
+            weq[wp] = __popc(me);
+        }
+        __syncthreads();
+        if (wp == 0) {
+            const int e0 = lane < nw ? weq[lane] : 0;
+            int es = e0;
+            if constexpr (LAYOUT == 0) {
+                const int g0 = lane < nw ? wgt[lane] : 0;
+                int gs = g0;
+#pragma unroll
+                for (int o = 1; o < 32; o <<= 1) {
+                    const int a = __shfl_up_sync(0xffffffffu, gs, o), b = __shfl_up_sync(0xffffffffu, es, o);
+                    if (lane >= o) gs += a, es += b;
+                }
+                if (lane < nw) wgt[lane] = base_gt + gs - g0, weq[lane] = base_eq + es - e0;
+                __syncwarp();
+                if (lane == 31) base_gt += gs, base_eq += es;
+            } else {
+#pragma unroll
+                for (int o = 1; o < 32; o <<= 1) {
+                    const int b = __shfl_up_sync(0xffffffffu, es, o);
+                    if (lane >= o) es += b;
+                }
+                if (lane < nw) weq[lane] = base_eq + es - e0;
+                __syncwarp();
+                if (lane == 31) base_eq += es;
+            }
+        }
+        __syncthreads();
+        const int e = weq[wp] + __popc(me & below);
+        if constexpr (LAYOUT == 0) {
+            int slot = -1;
+            if (gt) slot = wgt[wp] + __popc(mg & below);
+            else if (eq && e < remaining) slot = n_gt + e;
+            if (slot >= 0) emit(slot, i);
+        } else {
+            const bool sel = gt || (eq && e < remaining);
+            const unsigned ms = __ballot_sync(0xffffffffu, sel);
+            if (lane == 0) wsel[wp] = __popc(ms);
+            __syncthreads();
+            if (wp == 0) {
+                const int s0 = lane < nw ? wsel[lane] : 0;
+                int ss = s0;
+#pragma unroll
+                for (int o = 1; o < 32; o <<= 1) {
+                    const int a = __shfl_up_sync(0xffffffffu, ss, o);
+                    if (lane >= o) ss += a;
+                }
+                if (lane < nw) wsel[lane] = base_sel + ss - s0;
+                __syncwarp();
+                if (lane == 31) base_sel += ss;
+            }
+            __syncthreads();
+            if (sel) emit(wsel[wp] + __popc(ms & below), i);
+        }
+    }
+    return thr;
+}
+__global__ void __launch_bounds__(1024) topk_fast_kernel(const float* __restrict__ vals, long long stride, Rows r,
+                                                         const int* __restrict__ cand, int cand_stride, int blk,
+                                                         int* __restrict__ out, int out_stride, int smem_cap) {
+    pdl_wait();
+    pdl_trigger();
+    extern __shared__ __align__(16) uint32_t tk_skeys[];
+    const int t = blockIdx.x;
+    int n, k;
+    rows_at(r, t, n, k);
+    vals += (long long) t * stride;
+    out += (size_t) t * out_stride;
+    const int* cd = cand != nullptr ? cand + (size_t) t * cand_stride : nullptr;
+    if (n <= 0) return;
+    if (k >= n) {
+        for (int i = (int) threadIdx.x; i < n; i += (int) blockDim.x)
+            out[i] = cd != nullptr ? cd[i / blk] * blk + i % blk : i;
+        return;
+    }
+    uint32_t* skeys = (n <= smem_cap && smem_cap > 0) ? tk_skeys : nullptr;
+    topk_block_fast<0, 8>(n, k, skeys, [&](int i) { return ord_key(vals[i]); }, [&](int slot, int i) {
+        out[slot] = cd != nullptr ? cd[i / blk] * blk + i % blk : i;
+    });
+}
+__global__ void __launch_bounds__(1024) topk_seg_fast_kernel(const float* __restrict__ vals, long long stride, Rows r,
+                                                             int P, int K, float* __restrict__ sv,
+                                                             int* __restrict__ si, int* __restrict__ sn,
+                                                             uint32_t* __restrict__ sk, int smem_cap) {
+    pdl_wait();
+    pdl_trigger();
+    extern __shared__ __align__(16) uint32_t seg_skeys[];
+    const int p = blockIdx.x, t = blockIdx.y;
+    int n, k;
+    rows_at(r, t, n, k);
+    if (n <= 0 || k >= n) return;
+    vals += (long long) t * stride;
+    const int S = (n + P - 1) / P, lo = p * S, ns = max(0, min(n, lo + S) - lo);
+    float* cv = sv + ((size_t) t * P + p) * K;
+    int* ci = si + ((size_t) t * P + p) * K;
+    if (ns <= k) {
+        for (int i = (int) threadIdx.x; i < ns; i += (int) blockDim.x) cv[i] = vals[lo + i], ci[i] = lo + i;
+        if (threadIdx.x == 0) sn[t * P + p] = ns, sk[t * P + p] = 0u;
+        return;
+    }
+    uint32_t* skeys = (ns <= smem_cap && smem_cap > 0) ? seg_skeys : nullptr;
+    const uint32_t kth = topk_block_fast<1, 8>(
+        ns, k, skeys, [&](int i) { return ord_key(vals[lo + i]); },
+        [&](int slot, int i) { cv[slot] = vals[lo + i], ci[slot] = lo + i; });
+    if (threadIdx.x == 0) sn[t * P + p] = k, sk[t * P + p] = kth;
+}
+__global__ void __launch_bounds__(1024) topk_merge_fast_kernel(Rows r, int P, int K, const float* __restrict__ sv,
+                                                               const int* __restrict__ si, const int* __restrict__ sn,
+                                                               const uint32_t* __restrict__ sk, const int* __restrict__ cand,
+                                                               int cand_stride, int blk, int* __restrict__ out,
+                                                               int out_stride, int cap) {
+    pdl_wait();
+    pdl_trigger();
+    __shared__ int off[kTopkSegMax + 1];
+    __shared__ uint32_t floor_s;
+    extern __shared__ __align__(16) uint8_t merge_smem[];
+    float* mv = (float*) merge_smem;
+    int* mi = (int*) (merge_smem + (size_t) cap * 4);
+    __shared__ int warp_n[32], base_n, total_n;
+    const int t = blockIdx.x;
+    int n, k;
+    rows_at(r, t, n, k);
+    out += (size_t) t * out_stride;
+    const int* cd = cand != nullptr ? cand + (size_t) t * cand_stride : nullptr;
+    if (n <= 0) return;
+    if (k >= n) {
+        for (int i = (int) threadIdx.x; i < n; i += (int) blockDim.x)
+            out[i] = cd != nullptr ? cd[i / blk] * blk + i % blk : i;
+        return;
+    }
+    if (threadIdx.x == 0) {
+        off[0] = 0;
+        uint32_t f = 0u;
+        for (int p = 0; p < P; ++p) {
+            off[p + 1] = off[p] + sn[t * P + p];
+            f = max(f, sk[t * P + p]);
+        }
+        floor_s = f;
+        base_n = 0;
+        total_n = 0;
+    }
+    __syncthreads();
+    const float* cv = sv + (size_t) t * P * K;
+    const int* ci = si + (size_t) t * P * K;
+    const uint32_t fl = floor_s;
+    const int lane = (int) threadIdx.x & 31, wp = (int) threadIdx.x >> 5, nw = (int) blockDim.x >> 5;
+    const unsigned below = (1u << lane) - 1u;
+    bool fits = true;
+    for (int p = 0; p < P && fits; ++p) {
+        const int c = off[p + 1] - off[p];
+        for (int j0 = 0; j0 < c; j0 += (int) blockDim.x) {
+            const int j = j0 + (int) threadIdx.x;
+            const float x = j < c ? cv[(size_t) p * K + j] : 0.0f;
+            const bool keep = j < c && ord_key(x) >= fl;
+            const unsigned m = __ballot_sync(0xffffffffu, keep);
+            if (lane == 0) warp_n[wp] = __popc(m);
+            __syncthreads();
+            if (wp == 0) {
+                const int n0 = lane < nw ? warp_n[lane] : 0;
+                int ns = n0;
+#pragma unroll
+                for (int o = 1; o < 32; o <<= 1) {
+                    const int a = __shfl_up_sync(0xffffffffu, ns, o);
+                    if (lane >= o) ns += a;
+                }
+                if (lane < nw) warp_n[lane] = base_n + ns - n0;
+                __syncwarp();
+                if (lane == 31) {
+                    base_n += ns;
+                    total_n = base_n;
+                }
+            }
+            __syncthreads();
+            const int at = warp_n[wp] + __popc(m & below);
+            if (keep && at < cap) mv[at] = x, mi[at] = ci[(size_t) p * K + j];
+            if (total_n > cap) {
+                fits = false;
+                break;
+            }
+        }
+    }
+    if (fits) {
+        __syncthreads();
+        topk_block_fast<0, 4>(base_n, k, nullptr, [&](int i) { return ord_key(mv[i]); }, [&](int slot, int i) {
+            const int x = mi[i];
+            out[slot] = cd != nullptr ? cd[x / blk] * blk + x % blk : x;
+        });
+        return;
+    }
+    auto at = [&](int i) {
+        int lo = 0, hi = P;
+        while (hi - lo > 1) {
+            const int mid = (lo + hi) >> 1;
+            if (off[mid] <= i) lo = mid;
+            else hi = mid;
+        }
+        return (size_t) lo * K + (i - off[lo]);
+    };
+    topk_block_fast<0, 4>(off[P], k, nullptr, [&](int i) { return ord_key(cv[at(i)]); }, [&](int slot, int i) {
+        const int x = ci[at(i)];
+        out[slot] = cd != nullptr ? cd[x / blk] * blk + x % blk : x;
+    });
+}
 
 __global__ void block_max_kernel(const float* __restrict__ score, long long stride, Rows r, int blk,
                                  float* __restrict__ bm, long long bm_stride) {
@@ -4785,41 +5078,87 @@ void index_score(const float* q, const float* w, const void* k, int heads, int h
 }
 
 void topk(const float* vals, long long stride, int T, const Rows& r, const int* cand, int cand_stride, int blk,
-          int* out, int out_stride, cudaStream_t s, const TopkScratch* sc) {
-    if (sc != nullptr && T <= sc->T) {   // (a few long rows: spread over segments)
-        int nmax = 0, kmax = 0;
-        for (int t = 0; t < T; ++t) {
-            int n = 0, k = 0;
-            if (r.gen == 0) n = r.n[t], k = r.k[t];
-            else {
-                const int nn = (int) ((r.p0 + t + 1) / r.R), cb = std::min(r.ccap, (nn + r.blk - 1) / r.blk);
-                switch (r.gen) {
-                case 1: n = nn, k = std::min(r.kcap, nn); break;
-                case 2: n = nn, k = cb; break;
-                case 3: n = cb * r.blk, k = std::min(r.kcap, nn); break;
-                default: n = (nn + r.blk - 1) / r.blk, k = r.kcap; break;
-                }
+          int* out, int out_stride, cudaStream_t s, const TopkScratch* sc, bool fast) {
+    int nmax = 0, kmax = 0;
+    for (int t = 0; t < T; ++t) {
+        int n = 0, k = 0;
+        if (r.gen == 0) n = r.n[t], k = r.k[t];
+        else {
+            const int nn = (int) ((r.p0 + t + 1) / r.R), cb = std::min(r.ccap, (nn + r.blk - 1) / r.blk);
+            switch (r.gen) {
+            case 1: n = nn, k = std::min(r.kcap, nn); break;
+            case 2: n = nn, k = cb; break;
+            case 3: n = cb * r.blk, k = std::min(r.kcap, nn); break;
+            default: n = (nn + r.blk - 1) / r.blk, k = r.kcap; break;
             }
-            nmax = std::max(nmax, n), kmax = std::max(kmax, k);
         }
+        nmax = std::max(nmax, n), kmax = std::max(kmax, k);
+    }
+    static std::atomic<int> key_cap[64];
+    auto get_key_cap = [&](int dev) {
+        int kc = key_cap[dev & 63].load(std::memory_order_relaxed);
+        if (kc == 0) {
+            int optin = 0;
+            cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+            const int elems = std::max(0, std::min(20480, (optin - 10240) / 4));
+            if (elems > 0) {
+                cudaFuncSetAttribute(topk_fast_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, elems * 4);
+                cudaFuncSetAttribute(topk_seg_fast_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, elems * 4);
+            }
+            kc = elems > 0 ? elems : -1;
+            key_cap[dev & 63].store(kc, std::memory_order_relaxed);
+        }
+        return kc > 0 ? kc : 0;
+    };
+    if (sc != nullptr && T <= sc->T) {
         if (nmax >= kTopkSegMin && kmax <= sc->K) {
             const int P = std::min(sc->P, std::max(2, (nmax + kTopkSeg - 1) / kTopkSeg));
-            pdl_launch(topk_seg_kernel, dim3(P, T), 1024, 0, s, vals, stride, r, P, sc->K, sc->val, sc->idx, sc->cnt, sc->kth);
-            static std::atomic<int> merge_cap[64];   // (each device's cap, its shared memory opted in; 0: not yet)
-            int dev = 0;
-            cudaGetDevice(&dev);
-            int cap = merge_cap[dev & 63].load(std::memory_order_relaxed);
-            if (cap == 0) {
-                int optin = 0;
-                cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
-                cap = std::max(1024, std::min(kMergeCap, (optin - 4096) / 8)) & ~31;
-                cudaFuncSetAttribute(topk_merge_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, cap * 8);
-                merge_cap[dev & 63].store(cap, std::memory_order_relaxed);
+            if (fast) {
+                int dev = 0;
+                cudaGetDevice(&dev);
+                const int kc = get_key_cap(dev);
+                const int smax = (nmax + P - 1) / P;
+                const int scap = (smax <= kc) ? smax : 0;
+                pdl_launch(topk_seg_fast_kernel, dim3(P, T), 1024, (size_t) scap * 4, s, vals, stride, r, P, sc->K,
+                           sc->val, sc->idx, sc->cnt, sc->kth, scap);
+                static std::atomic<int> merge_fast_cap[64];
+                int cap = merge_fast_cap[dev & 63].load(std::memory_order_relaxed);
+                if (cap == 0) {
+                    int optin = 0;
+                    cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+                    cap = std::max(1024, std::min(kMergeCap, (optin - 8192) / 8)) & ~31;
+                    cudaFuncSetAttribute(topk_merge_fast_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, cap * 8);
+                    merge_fast_cap[dev & 63].store(cap, std::memory_order_relaxed);
+                }
+                pdl_launch(topk_merge_fast_kernel, T, 1024, (size_t) cap * 8, s, r, P, sc->K, sc->val, sc->idx, sc->cnt,
+                           sc->kth, cand, cand_stride, blk, out, out_stride, cap);
+            } else {
+                pdl_launch(topk_seg_kernel, dim3(P, T), 1024, 0, s, vals, stride, r, P, sc->K, sc->val, sc->idx, sc->cnt, sc->kth);
+                static std::atomic<int> merge_cap[64];
+                int dev = 0;
+                cudaGetDevice(&dev);
+                int cap = merge_cap[dev & 63].load(std::memory_order_relaxed);
+                if (cap == 0) {
+                    int optin = 0;
+                    cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+                    cap = std::max(1024, std::min(kMergeCap, (optin - 4096) / 8)) & ~31;
+                    cudaFuncSetAttribute(topk_merge_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, cap * 8);
+                    merge_cap[dev & 63].store(cap, std::memory_order_relaxed);
+                }
+                pdl_launch(topk_merge_kernel, T, 1024, (size_t) cap * 8, s, r, P, sc->K, sc->val, sc->idx, sc->cnt, sc->kth, cand,
+                           cand_stride, blk, out, out_stride, cap);
             }
-            pdl_launch(topk_merge_kernel, T, 1024, (size_t) cap * 8, s, r, P, sc->K, sc->val, sc->idx, sc->cnt, sc->kth, cand,
-                       cand_stride, blk, out, out_stride, cap);
             return;
         }
+    }
+    if (fast) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        const int kc = get_key_cap(dev);
+        const int scap = (nmax > 0 && nmax <= kc) ? nmax : 0;
+        pdl_launch(topk_fast_kernel, T, 1024, (size_t) scap * 4, s, vals, stride, r, cand, cand_stride, blk, out,
+                   out_stride, scap);
+        return;
     }
     pdl_launch(topk_kernel, T, 1024, 0, s, vals, stride, r, cand, cand_stride, blk, out, out_stride);
 }

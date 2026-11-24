@@ -22931,7 +22931,7 @@ struct Model::Impl {
                             tr.k[t] = lim.k[t];
                         }
                         topk(d.scores, ss, T, tr, cand_r, (int) cand_stride(), g.cand_blk, topk_r, (int) topk_stride(), s,
-                             &d.tks);
+                             &d.tks, true);
                     } else {
                         index_score(d.iq, d.iw, (*A.ik)[(size_t) l.dev], g.ix_heads, g.ix_hd, T, clen_max, nullptr, 0, 1,
                                     lim, d.scores, ss, s);
@@ -22946,7 +22946,7 @@ struct Model::Impl {
                             cand_blocks(d.scores, ss, T, cr, g.cand_blk, d.bm, (long long) bm_stride(), cand_r,
                                         (int) cand_stride(), s);
                         }
-                        topk(d.scores, ss, T, lim, nullptr, 0, 1, topk_r, (int) topk_stride(), s, &d.tks);
+                        topk(d.scores, ss, T, lim, nullptr, 0, 1, topk_r, (int) topk_stride(), s, &d.tks, true);
                         if (topk_check) {   // (into cand_r's rows past the window's: scratch here)
                             const size_t nw = (size_t) T * topk_stride();
                             std::vector<int> tkc_a(nw), tkc_b(nw);
