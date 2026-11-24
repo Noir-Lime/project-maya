@@ -1714,7 +1714,17 @@ struct Model::Impl {
     // at a window's end: the host's l.helper at the tick, the helper's table by a 'tables' job the tick puts in hq
     // before the next window's requests (helper_tables, on the helper's stream before their takes)
     int hr_want = 0, hr_need = 2, hr_win = 8, hr_fills = 2;   // (helper_parse: whole numbers in range, else refused)
-    static constexpr int kHrQueued = 8;   // fills queued or under way at most (the rest wait for a later tick)
+    // fills queued or under way at most (the rest wait for a later tick); DS4_HELPER_RECENT_QUEUE (hrfast)
+    static int hr_queue_env() {
+        const char* v = ds4_env("DS4_HELPER_RECENT_QUEUE");
+        return v != nullptr ? std::clamp(std::atoi(v), 1, 256) : 8;
+    }
+    const int kHrQueued = hr_queue_env();
+    // DS4_HELPER_RECENT_DMA=1: a fill DMA'd from its pinned RAM copy, no stage (hrfast)
+    static bool hr_dma_env() {
+        const char* v = ds4_env("DS4_HELPER_RECENT_DMA");
+        return v != nullptr && std::atoi(v) != 0;
+    }
     unsigned hr_clock = 0;
     struct HrFill {
         int layer = 0, slot = 0, e = 0;
@@ -15624,15 +15634,23 @@ struct Model::Impl {
             }
             const Layer& l = L[(size_t) f.layer];
             f.ok = false;
-            if (!helper_dead.load(std::memory_order_relaxed) && !hr_busy.load() && read_mx(l, f.e, hr_stage)) {
+            // (hrfast: from the pinned RAM copy as the prompt path's DS4_FLOW_COPY_DMA, else through the stage)
+            const bool dma = hr_dma_env() && copy_mode && cp_dma && NH == 1 && !l.ram.empty() && l.ram[(size_t) f.e] >= 0;
+            if (!helper_dead.load(std::memory_order_relaxed) && !hr_busy.load() && (dma || read_mx(l, f.e, hr_stage))) {
                 int cur = 0;
                 cudaGetDevice(&cur);
                 // (the copy once submitted reads the stage until it ends: its end is waited for by its event - or, if
                 //  the event could not be recorded, by the stream itself - bounded; any end but a clean one stops the
                 //  fills and keeps the stage and the pool)
-                const bool submitted = cudaSetDevice(hlp[0].id) == cudaSuccess &&
-                                       cudaMemcpyAsync(l.hr_base + (size_t) f.slot * align256(l.blob), hr_stage, l.blob,
-                                                       cudaMemcpyHostToDevice, hr_st) == cudaSuccess;
+                uint8_t* const to = l.hr_base + (size_t) f.slot * align256(l.blob);
+                bool submitted = cudaSetDevice(hlp[0].id) == cudaSuccess;
+                if (submitted && dma) {
+                    const uint8_t* from = ram_part[(size_t) l.ram[(size_t) f.e]][0];
+                    for (int r = 0; r < 3 && submitted; ++r)
+                        submitted = cudaMemcpyAsync(to + l.lay.trellis[r], from + cp_lay[(size_t) l.il][(size_t) r],
+                                                    mx_part_bytes(l, r), cudaMemcpyHostToDevice, hr_st) == cudaSuccess;
+                } else if (submitted)
+                    submitted = cudaMemcpyAsync(to, hr_stage, l.blob, cudaMemcpyHostToDevice, hr_st) == cudaSuccess;
                 const bool recorded = submitted && cudaEventRecord(hr_fill_ev, hr_st) == cudaSuccess;
                 if (submitted) {
                     const double t0 = now_ms();
