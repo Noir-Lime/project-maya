@@ -2020,6 +2020,25 @@ __device__ __forceinline__ uint4 unpack8(uint32_t cw, uint32_t sb) {
     return make_uint4(o[0], o[1], o[2], o[3]);
 }
 
+// 4 rows/CTA (64 threads -> 4x CTAs) version of unpack_sel_kernel
+__global__ void __launch_bounds__(64) unpack_sel_fast_kernel(const uint8_t* __restrict__ ckv,
+                                                              const int* __restrict__ sel, int sel_stride, AttnRows ar,
+                                                              int cap, uint16_t* __restrict__ out) {
+    pdl_wait();
+    pdl_trigger();
+    const int t = blockIdx.y, i = blockIdx.x * 4 + (int) (threadIdx.x >> 4), part = threadIdx.x & 15;
+    int n_sel;
+    if (ar.gen) {
+        const long long pa = ar.p0 + ar.t0 + t;
+        n_sel = ar.R > 0 ? (int) min((long long) ar.kcap, (pa + 1) / ar.R) : 0;
+    } else {
+        n_sel = ar.nsel[t];
+    }
+    if (i >= n_sel) return;
+    const size_t r = (size_t) t * cap + i;
+    unpack32(ckv + (size_t) sel[(size_t) t * sel_stride + i] * kv_row_bytes(kKvFp4, 512), part,
+             (uint4*) (out + r * 512 + part * 32));
+}
 // a few queries' attention (a decode step, a short window): the rows each query selects decoded once to BF16 rows -
 // out[t * cap + i] = ckv[sel[t][i]] for i < the query's n_sel - for the BF16 kernel reading them in place (once a
 // query, not once a head)
@@ -2063,6 +2082,121 @@ __device__ __forceinline__ int attn_tile_offset(int row, int col) {
         return row * 512 + p * 8 + (col & 7);
     }
     return row * 512 + col;
+}
+
+template <int G>
+__global__ void __launch_bounds__(kThreads) sparse_attn_bf16_g_kernel(
+    const float* __restrict__ q, const uint16_t* __restrict__ win, const uint16_t* __restrict__ ckv,
+    int sel_stride, AttnRows ar, const float* __restrict__ sink, int heads, float scale, float* __restrict__ out) {
+    pdl_wait();
+    pdl_trigger();
+    constexpr int d = 512, W = 8 / G;
+    const int hb = blockIdx.x * G, t = blockIdx.y;
+    int n_win, n_sel, w0;
+    if (ar.gen) {
+        const long long ta = ar.t0 + t, pa = ar.p0 + ta;
+        const long long first = max((long long) ar.win - ar.p0, ta + 1);
+        w0 = (int) first;
+        n_win = (int) (ar.win + ta - first + 1);
+        n_sel = ar.R > 0 ? (int) min((long long) ar.kcap, (pa + 1) / ar.R) : 0;
+    } else {
+        n_win = ar.nwin[t], n_sel = ar.nsel[t], w0 = ar.win0[t];
+    }
+    const uint16_t* wbase = win + (size_t) w0 * d;
+    const uint16_t* cbase = ckv + (size_t) t * sel_stride * d;
+    extern __shared__ __align__(16) uint16_t tile[];
+    __shared__ float sc[G][kAttTile];
+    __shared__ float m_run_s[G], tile_scale_s[G], den_s[G];
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, gw = wp / W, wr = wp % W;
+    float qr[16];
+#pragma unroll
+    for (int x = 0; x < 16; ++x) qr[x] = q[((size_t) t * heads + hb + gw) * d + lane * 16 + x];
+    if (threadIdx.x < G) {
+        m_run_s[threadIdx.x] = -1e30f;
+        den_s[threadIdx.x] = 0.0f;
+    }
+    float o0[G], o1[G];
+#pragma unroll
+    for (int g = 0; g < G; ++g) o0[g] = o1[g] = 0.0f;
+    const int c = (int) threadIdx.x * 2;
+    const int total = n_win + n_sel;
+    if (total == 0) __syncthreads();
+    for (int t0 = 0; t0 < total; t0 += kAttTile) {
+        const int nt = min(kAttTile, total - t0);
+        for (int r0 = 0; r0 < nt; r0 += 8) {
+            const int r = r0 + wp;
+            if (r < nt) {
+                const int j = t0 + r;
+                const uint16_t* rr = j < n_win ? wbase + (size_t) j * d : cbase + (size_t) (j - n_win) * d;
+                const uint4 a0 = *(const uint4*) (rr + lane * 8);
+                const uint4 a1 = *(const uint4*) (rr + 256 + lane * 8);
+                *(uint4*) (tile + attn_tile_offset<false>(r, lane * 8)) = a0;
+                *(uint4*) (tile + attn_tile_offset<false>(r, 256 + lane * 8)) = a1;
+            }
+        }
+        __syncthreads();
+#pragma unroll 2
+        for (int r = wr; r < nt; r += W) {
+            const uint4 a = *(const uint4*) (tile + attn_tile_offset<false>(r, lane * 16));
+            const uint4 b = *(const uint4*) (tile + attn_tile_offset<false>(r, lane * 16 + 8));
+            const uint16_t* pa = (const uint16_t*) &a;
+            const uint16_t* pb = (const uint16_t*) &b;
+            float s = 0.0f;
+#pragma unroll
+            for (int x = 0; x < 8; ++x) s += qr[x] * bf16f(pa[x]);
+#pragma unroll
+            for (int x = 0; x < 8; ++x) s += qr[8 + x] * bf16f(pb[x]);
+            s = warp_sum(s);
+            if (lane == 0) sc[gw][r] = s * scale;
+        }
+        __syncthreads();
+        if (wp < G) {
+            float* scg = sc[wp];
+            float m = -INFINITY;
+            for (int j = lane; j < nt; j += 32) m = fmaxf(m, scg[j]);
+            m = warp_max(m);
+            const float m_old = m_run_s[wp];
+            const float m_new = fmaxf(m_old, m);
+            float s = 0.0f;
+            for (int j = lane; j < nt; j += 32) {
+                const float p = expf(scg[j] - m_new);
+                scg[j] = p;
+                s += p;
+            }
+            s = warp_sum(s);
+            __syncwarp();
+            if (lane == 0) {
+                tile_scale_s[wp] = expf(m_old - m_new);
+                den_s[wp] = den_s[wp] * tile_scale_s[wp] + s;
+                m_run_s[wp] = m_new;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int g = 0; g < G; ++g) {
+            const float cs = tile_scale_s[g];
+            o0[g] *= cs;
+            o1[g] *= cs;
+        }
+#pragma unroll 8
+        for (int r = 0; r < nt; ++r) {
+            const uint32_t pr = *(const uint32_t*) (tile + attn_tile_offset<false>(r, c));
+            const float v0 = bf16f((uint16_t) (pr & 0xffffu)), v1 = bf16f((uint16_t) (pr >> 16));
+#pragma unroll
+            for (int g = 0; g < G; ++g) {
+                o0[g] += sc[g][r] * v0;
+                o1[g] += sc[g][r] * v1;
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        const float den = den_s[g] + expf(sink[hb + g] - m_run_s[g]);
+        float* ov = out + ((size_t) t * heads + hb + g) * d;
+        ov[c] = o0[g] / den;
+        ov[c + 1] = o1[g] / den;
+    }
 }
 
 template <int G, bool Swizzle = false>
@@ -5073,7 +5207,7 @@ bool attn_few(int T, int sel_stride, const AttnScratch* scr) {
 
 void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
                  const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
-                 int ckv_fmt, int heads_per_block, const AttnScratch* scr) {
+                 int ckv_fmt, int heads_per_block, const AttnScratch* scr, bool fast) {
     if (d != 512 || (ckv_fmt != kKvFp4 && ckv_fmt != kKvBf16)) {
         std::fprintf(stderr, "ds4 sparse_attn: head dim %d (rows %d) not covered\n", d, ckv_fmt);
         return;
@@ -5114,9 +5248,23 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     // the BF16 rows' kernel itself (heads_per_block -1: this way at any T)
     const bool few = heads_per_block == -1 || (heads_per_block == 0 && T <= kAttnScratchT);   // (0: attn_few)
     if (few && attn_scr_fits(T, sel_stride, scr)) {
-        pdl_launch(unpack_sel_kernel, dim3(cdiv(sel_stride, kStage), T), kThreads, 0, s, (const uint8_t*) ckv, sel, sel_stride, a,
-                   scr->cap, scr->rows);
+        if (fast)
+            pdl_launch(unpack_sel_fast_kernel, dim3(cdiv(sel_stride, 4), T), 64, 0, s, (const uint8_t*) ckv, sel,
+                       sel_stride, a, scr->cap, scr->rows);
+        else
+            pdl_launch(unpack_sel_kernel, dim3(cdiv(sel_stride, kStage), T), kThreads, 0, s, (const uint8_t*) ckv, sel,
+                       sel_stride, a, scr->cap, scr->rows);
 #if !defined(MAYA_USE_HIP)
+        if (fast && T > 1 && heads % 2 == 0) {
+            constexpr int kDyn = kAttTile * 512 * (int) sizeof(uint16_t);
+            static const bool attr2 =
+                (cudaFuncSetAttribute(sparse_attn_bf16_g_kernel<2>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      kDyn) == cudaSuccess);
+            (void) attr2;
+            pdl_launch(sparse_attn_bf16_g_kernel<2>, dim3(heads / 2, T), kThreads, kDyn, s, q, win, scr->rows,
+                       scr->cap, a, sink, heads, scale, out);
+            return;
+        }
         if (T == 1)   // (V100: the loads ahead pay for the decode's kernel at one query, not at more)
             pdl_launch(sparse_attn_kernel<true, 8>, dim3(heads, T), kThreads, 0, s, q, win, scr->rows, nullptr, scr->cap, a, sink,
                        heads, d, scale, out);

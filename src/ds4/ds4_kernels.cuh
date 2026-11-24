@@ -251,7 +251,8 @@ struct AttnRows {
 };
 void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
                  const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
-                 int ckv_fmt = kKvFp4, int heads_per_block = 0, const AttnScratch* scr = nullptr);
+                 int ckv_fmt = kKvFp4, int heads_per_block = 0, const AttnScratch* scr = nullptr,
+                 bool fast = false);
 /// Whether sparse_attn (kKvFp4, heads_per_block 0) takes T queries through the few-queries path: the selected rows
 /// decoded into scr, then the BF16 rows' kernel.
 bool attn_few(int T, int sel_stride, const AttnScratch* scr);
