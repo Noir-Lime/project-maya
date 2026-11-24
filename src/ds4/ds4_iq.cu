@@ -2032,6 +2032,8 @@ static bool ne56() {
 template <int T, int EPI = 0>
 void gu_ne(const Args& a, dim3 grid, int ne, cudaStream_t s) {
     if (ne <= 1) launch_gu<T, 1, EPI>(a, grid, s);
+    else if (EPI == 0 && ne == 2) launch_gu<T, 2, EPI>(a, grid, s);
+    else if (EPI == 0 && ne == 3) launch_gu<T, 3, EPI>(a, grid, s);
     else if (ne <= 4) launch_gu<T, 4, EPI>(a, grid, s);
     else if (ne <= 5 && ne56()) launch_gu<T, 5, EPI>(a, grid, s);
     else if (ne <= 6 && ne56()) launch_gu<T, 6, EPI>(a, grid, s);
@@ -2041,6 +2043,8 @@ void gu_ne(const Args& a, dim3 grid, int ne, cudaStream_t s) {
 template <int T>
 void dn_ne(const Args& a, dim3 grid, int ne, cudaStream_t s) {
     if (ne <= 1) launch_dn<T, 1>(a, grid, s);
+    else if (ne == 2) launch_dn<T, 2>(a, grid, s);
+    else if (ne == 3) launch_dn<T, 3>(a, grid, s);
     else if (ne <= 4) launch_dn<T, 4>(a, grid, s);
     else if (ne <= 5 && ne56()) launch_dn<T, 5>(a, grid, s);
     else if (ne <= 6 && ne56()) launch_dn<T, 6>(a, grid, s);
