@@ -32,6 +32,12 @@ struct IqCpu {
 bool iq_cpu_fmt(int tg, int td, int n_embd, int n_ff, IqCpu& f, std::string& err);
 /// x (k values) as the activation type `act` (f.gu_act / f.d_act) into dst.
 void iq_cpu_quant(int act, const float* x, int k, void* dst);
+/// Bit-exact AVX2 (fp-contract=off) Q8_K quant of nb 256-float blocks into dst (scalar fallback if no AVX2).
+void iq_cpu_quant_q8k_avx2(const float* x, int nb, void* dst);
+/// Bit-exact AVX2 (fp-contract=off) weighted slot sum: o[e] = 0; o[e] += ws[sl] * ys[sl][e] for e in [c0, c1).
+void iq_cpu_sum_slots_avx2(float* o, const float* const* ys, const float* ws, int nslots, int c0, int c1);
+/// Bit-exact AVX2 (fp-contract=off) helper sum into o[c0..c1).
+void iq_cpu_add_helpers_avx2(float* o, const float* const* ys, int cnt, bool has_cpu, int c0, int c1);
 /// ff[t][r] = clamped swiglu(gate_r . a[t], up_r . a[t]) for rows [r0, r1) (limit 0: no clamp), nt tokens.
 void iq_cpu_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, const void* const* act, int nt,
                     float* const* ff, int r0, int r1, float limit);

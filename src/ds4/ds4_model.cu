@@ -11715,6 +11715,7 @@ struct Model::Impl {
         // entries take it - then a row a slot (kWin + slot): a token past the window's input (none on the decode or
         // chunk paths), then (x no longer needed) the slot's h
         const bool par_ls = true;
+        const bool par_ls2 = true;
         uint8_t* aq = (uint8_t*) c_xh.data();
         auto x_act = [&](const Ent& en, int i) -> uint8_t* {
             const int t = en.tok[i];
@@ -11740,7 +11741,24 @@ struct Model::Impl {
                     }
                 }
             const QaItem* qai = qa_vec.empty() ? qa_buf : qa_vec.data();
-            if (par_ls && nqa > 0 && fm.gu_blk > 0 && !pools.empty()) {
+            if (par_ls2 && nqa > 0 && fm.gu_blk == 256 && fm.gu_blk_bytes == 292 && E % 256 == 0) {
+                const int nb = E / 256;
+                const int tot_blk = nqa * nb;
+                if (tot_blk < 61 || pools.empty()) {
+                    for (int it = 0; it < nqa; ++it) gg::iq_cpu_quant_q8k_avx2(qai[it].src, nb, qai[it].dst);
+                } else {
+                    const int W = std::max(1, pools[0]->size());
+                    const int bpb = std::max(2, (tot_blk + W - 1) / W);
+                    const int jpt = (nb + bpb - 1) / bpb;
+                    const int nj = nqa * jpt;
+                    pools[0]->run(nj, [&](int j) {
+                        const int it = j / jpt, blk0 = (j % jpt) * bpb;
+                        const int cnt = std::min(bpb, nb - blk0);
+                        gg::iq_cpu_quant_q8k_avx2(qai[it].src + (size_t) blk0 * 256, cnt,
+                                                  qai[it].dst + (size_t) blk0 * 292);
+                    });
+                }
+            } else if (par_ls && nqa > 0 && fm.gu_blk > 0 && !pools.empty()) {
                 const int W = std::max(1, pools[0]->size());
                 const int nb = E / fm.gu_blk;
                 const int bpb = std::max(2, (nqa * nb + W - 1) / W);
@@ -11794,9 +11812,15 @@ struct Model::Impl {
                         const int b0 = blk * bs, b1 = b0 + bs;
                         const int got = std::min(r1, b1) - std::max(r0, b0);
                         if (qb_rem[(size_t) e_idx * d_nblk + blk].v.fetch_sub(got, std::memory_order_acq_rel) == got) {
-                            for (int i = 0; i < en.n; ++i)
-                                gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF + (size_t) b0, bs,
-                                                 aq + (size_t) (kWin + en.slot0 + i) * E * 4 + (size_t) blk * bb);
+                            if (par_ls2 && bs == 256 && bb == 292) {
+                                for (int i = 0; i < en.n; ++i)
+                                    gg::iq_cpu_quant_q8k_avx2(c_xhd.data() + (size_t) (en.slot0 + i) * FF + (size_t) b0, 1,
+                                                              aq + (size_t) (kWin + en.slot0 + i) * E * 4 + (size_t) blk * 292);
+                            } else {
+                                for (int i = 0; i < en.n; ++i)
+                                    gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF + (size_t) b0, bs,
+                                                     aq + (size_t) (kWin + en.slot0 + i) * E * 4 + (size_t) blk * bb);
+                            }
                         }
                     }
                 }
@@ -11827,9 +11851,13 @@ struct Model::Impl {
                     pools[0]->run(nj, [&](int j) {
                         const int it = j / jpt, blk0 = (j % jpt) * kBpb, sl = slp[it];
                         const int cnt = std::min(kBpb, nb - blk0);
-                        gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) sl * FF + (size_t) blk0 * fm.d_blk,
-                                         cnt * fm.d_blk,
-                                         aq + (size_t) (kWin + sl) * E * 4 + (size_t) blk0 * fm.d_blk_bytes);
+                        if (par_ls2 && fm.d_blk == 256 && fm.d_blk_bytes == 292)
+                            gg::iq_cpu_quant_q8k_avx2(c_xhd.data() + (size_t) sl * FF + (size_t) blk0 * 256, cnt,
+                                                      aq + (size_t) (kWin + sl) * E * 4 + (size_t) blk0 * 292);
+                        else
+                            gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) sl * FF + (size_t) blk0 * fm.d_blk,
+                                             cnt * fm.d_blk,
+                                             aq + (size_t) (kWin + sl) * E * 4 + (size_t) blk0 * fm.d_blk_bytes);
                     });
                 } else {
                     for (int it = 0; it < nqb; ++it)
@@ -11845,16 +11873,33 @@ struct Model::Impl {
         }
         const bool fuse_sum = (par_ls && ps != nullptr && ps->n_act > 0 && NH == 1);
         const bool single_slot_each = (fuse_sum && ne == 1 && ps->nslots == ps->n_act);
-        constexpr int kSumChunk = 64;
-        const int sum_nc = fuse_sum ? (E + kSumChunk - 1) / kSumChunk : 0;
+        const int sum_chunk = par_ls2 ? 96 : 64;
+        const int sum_nc = fuse_sum ? (E + sum_chunk - 1) / sum_chunk : 0;
+        int sum_tok_off[kWin + 1] = {};
+        const float* sum_ys[kWin * kPicks] = {};
+        float sum_ws[kWin * kPicks] = {};
         if (fuse_sum && !single_slot_each) {
             if (sum_rem_cap < (size_t) sum_nc) {
                 sum_rem.reset(new LaneFuseCnt[(size_t) sum_nc]);
                 sum_rem_cap = (size_t) sum_nc;
             }
             for (int c = 0; c < sum_nc; ++c) {
-                const int c0 = c * kSumChunk, c1 = std::min(E, c0 + kSumChunk);
+                const int c0 = c * sum_chunk, c1 = std::min(E, c0 + sum_chunk);
                 sum_rem[(size_t) c].v.store(ne * (c1 - c0), std::memory_order_relaxed);
+            }
+            if (par_ls2) {
+                int pos = 0;
+                for (int ti = 0; ti < ps->n_act; ++ti) {
+                    sum_tok_off[ti] = pos;
+                    const int t = ps->act_toks[ti];
+                    for (int sl = 0; sl < ps->nslots; ++sl) {
+                        if (ps->tok_of[sl] != t) continue;
+                        sum_ys[pos] = c_yd.data() + (size_t) sl * E;
+                        sum_ws[pos] = ps->wv[sl];
+                        ++pos;
+                    }
+                }
+                sum_tok_off[ps->n_act] = pos;
             }
         }
         for (int X = 0; X < NH; ++X)
@@ -11870,30 +11915,46 @@ struct Model::Impl {
                 gg::iq_cpu_down(fm, ent_part(l, en, 2, X), hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
                 if (fuse_sum) {
                     if (single_slot_each) {
-                        for (int i = 0; i < en.n; ++i) {
-                            const float w = ps->wv[en.slot0 + i];
-                            const float* y = yp[i];
-                            float* o = ps->rp->part[en.tok[i]];
-                            for (int e = r0; e < r1; ++e) {
-                                o[e] = 0.0f;
-                                o[e] += w * y[e];
+                        if (par_ls2) {
+                            for (int i = 0; i < en.n; ++i) {
+                                const float w = ps->wv[en.slot0 + i];
+                                const float* y = yp[i];
+                                gg::iq_cpu_sum_slots_avx2(ps->rp->part[en.tok[i]], &y, &w, 1, r0, r1);
+                            }
+                        } else {
+                            for (int i = 0; i < en.n; ++i) {
+                                const float w = ps->wv[en.slot0 + i];
+                                const float* y = yp[i];
+                                float* o = ps->rp->part[en.tok[i]];
+                                for (int e = r0; e < r1; ++e) {
+                                    o[e] = 0.0f;
+                                    o[e] += w * y[e];
+                                }
                             }
                         }
                     } else {
-                        const int sc0 = r0 / kSumChunk, sc1 = (r1 - 1) / kSumChunk;
+                        const int sc0 = r0 / sum_chunk, sc1 = (r1 - 1) / sum_chunk;
                         for (int c = sc0; c <= sc1; ++c) {
-                            const int c0 = c * kSumChunk, c1 = std::min(E, c0 + kSumChunk);
+                            const int c0 = c * sum_chunk, c1 = std::min(E, c0 + sum_chunk);
                             const int got = std::min(r1, c1) - std::max(r0, c0);
                             if (sum_rem[(size_t) c].v.fetch_sub(got, std::memory_order_acq_rel) == got) {
-                                for (int ti = 0; ti < ps->n_act; ++ti) {
-                                    const int t = ps->act_toks[ti];
-                                    float* o = ps->rp->part[t];
-                                    for (int e = c0; e < c1; ++e) o[e] = 0.0f;
-                                    for (int sl = 0; sl < ps->nslots; ++sl) {
-                                        if (ps->tok_of[sl] != t) continue;
-                                        const float* y = c_yd.data() + (size_t) sl * E;
-                                        const float w = ps->wv[sl];
-                                        for (int e = c0; e < c1; ++e) o[e] += w * y[e];
+                                if (par_ls2) {
+                                    for (int ti = 0; ti < ps->n_act; ++ti) {
+                                        const int a = sum_tok_off[ti], b = sum_tok_off[ti + 1];
+                                        gg::iq_cpu_sum_slots_avx2(ps->rp->part[ps->act_toks[ti]],
+                                                                  sum_ys + a, sum_ws + a, b - a, c0, c1);
+                                    }
+                                } else {
+                                    for (int ti = 0; ti < ps->n_act; ++ti) {
+                                        const int t = ps->act_toks[ti];
+                                        float* o = ps->rp->part[t];
+                                        for (int e = c0; e < c1; ++e) o[e] = 0.0f;
+                                        for (int sl = 0; sl < ps->nslots; ++sl) {
+                                            if (ps->tok_of[sl] != t) continue;
+                                            const float* y = c_yd.data() + (size_t) sl * E;
+                                            const float w = ps->wv[sl];
+                                            for (int e = c0; e < c1; ++e) o[e] += w * y[e];
+                                        }
                                     }
                                 }
                             }
@@ -16323,6 +16384,8 @@ struct Model::Impl {
         uint64_t gate_seen = 0;
         bool deep = false;
         std::vector<Ent> ents, hents;
+        std::vector<std::pair<int, int>> picks_buf;
+        picks_buf.reserve(kWin * kPicks);
         std::vector<std::vector<std::pair<int, int>>> hpv(hlp.size());   // (expert, t * kPicks + i), a helper's each
         while (!quit.load(std::memory_order_relaxed)) {
             if (deep) gate_seen = gate.epoch();   // (before the look at the ring: a poke after it ends the sleep at once)
@@ -16364,7 +16427,10 @@ struct Model::Impl {
                 float wv[kWin * kPicks];
                 int tok_of[kWin * kPicks], pick_of[kWin * kPicks];
                 int nslots = 0;
-                std::vector<std::pair<int, int>> picks;   // (expert, t * kPicks + i), CPU-lane only
+                const bool par_ls2 = true;
+                std::vector<std::pair<int, int>> picks_tmp;
+                std::vector<std::pair<int, int>>& picks = par_ls2 ? picks_buf : picks_tmp;
+                if (par_ls2) picks.clear();
                 // the helper's (DS4_HELPER: a layer with experts in its pool, while it works) - its own lane: not the
                 // CPU lane's cache hits, RAM tier, disk skip or stream
                 const bool hon = l.helper_tab != nullptr && !helper_dead.load(std::memory_order_relaxed);
@@ -16605,7 +16671,32 @@ struct Model::Impl {
                                 add_h(hj);
                             }
                             if (need_acq) std::atomic_thread_fence(std::memory_order_acquire);
-                            if (total_ops == 1) {
+                            if (par_ls2 && total_ops > 0) {
+                                if (total_ops < 2 || pools.empty()) {
+                                    for (int t = 0; t < T; ++t) {
+                                        if (bh_n[t] == 0) continue;
+                                        gg::iq_cpu_add_helpers_avx2(rp.part[t], bh_ptr[t], bh_n[t],
+                                                                    rp.cpu[t] != 0, 0, (int) D);
+                                        rp.cpu[t] = 1;
+                                    }
+                                } else {
+                                    int act_t[kWin], na = 0;
+                                    for (int t = 0; t < T; ++t) if (bh_n[t] > 0) act_t[na++] = t;
+                                    const int W = std::max(1, pools[0]->size());
+                                    const int target_nc = std::max(1, (1 * W) / na);
+                                    const size_t raw_c = (D + (size_t) target_nc - 1) / (size_t) target_nc;
+                                    const size_t h_chunk = std::max<size_t>(16, ((raw_c + 15) / 16) * 16);
+                                    const int nc = (int) ((D + h_chunk - 1) / h_chunk);
+                                    pools[0]->run(na * nc, [&](int j) {
+                                        const int t = act_t[j / nc];
+                                        const size_t c0 = (size_t) (j % nc) * h_chunk;
+                                        const size_t c1 = std::min(D, c0 + h_chunk);
+                                        gg::iq_cpu_add_helpers_avx2(rp.part[t], bh_ptr[t], bh_n[t],
+                                                                    rp.cpu[t] != 0, (int) c0, (int) c1);
+                                    });
+                                    for (int k = 0; k < na; ++k) rp.cpu[act_t[k]] = 1;
+                                }
+                            } else if (total_ops == 1) {
                                 for (int t = 0; t < T; ++t) {
                                     if (bh_n[t] == 0) continue;
                                     const float* y = bh_ptr[t][0];

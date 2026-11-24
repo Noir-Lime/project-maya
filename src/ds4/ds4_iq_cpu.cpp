@@ -44,9 +44,11 @@
 #if defined(IQ_X86) && (defined(__GNUC__) || defined(__clang__))
 #define IQ_AVX2 __attribute__((target("avx2,fma")))
 #define IQ_AVX1 __attribute__((target("avx,sse4.1,ssse3")))
+#define IQ_AVX2_NOFMA __attribute__((target("avx2"), optimize("fp-contract=off")))
 #else
 #define IQ_AVX2
 #define IQ_AVX1
+#define IQ_AVX2_NOFMA
 #endif
 
 namespace maya::ds4::gguf {
@@ -1797,6 +1799,185 @@ bool own_nt(int type, int nt) {
 }
 }  // namespace
 
+#if defined(IQ_X86)
+IQ_AVX2_NOFMA void quant_q8k_avx2_blocks(const float* x, block_q8_K* y, int nb) {
+    const __m256 vabs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    const __m256 vmagic = _mm256_set1_ps(12582912.f);
+    const __m256i vmask = _mm256_set1_epi32(0x007fffff);
+    const __m256i voff = _mm256_set1_epi32(0x00400000);
+    const __m256i v127 = _mm256_set1_epi32(127);
+    const __m128i vones16 = _mm_set1_epi16(1);
+
+    for (int i = 0; i < nb; ++i) {
+        __m256 m0 = _mm256_setzero_ps(), m1 = _mm256_setzero_ps();
+        __m256 m2 = _mm256_setzero_ps(), m3 = _mm256_setzero_ps();
+        for (int j = 0; j < QK_K; j += 32) {
+            m0 = _mm256_max_ps(_mm256_and_ps(_mm256_loadu_ps(x + j + 0), vabs), m0);
+            m1 = _mm256_max_ps(_mm256_and_ps(_mm256_loadu_ps(x + j + 8), vabs), m1);
+            m2 = _mm256_max_ps(_mm256_and_ps(_mm256_loadu_ps(x + j + 16), vabs), m2);
+            m3 = _mm256_max_ps(_mm256_and_ps(_mm256_loadu_ps(x + j + 24), vabs), m3);
+        }
+        m0 = _mm256_max_ps(_mm256_max_ps(m0, m1), _mm256_max_ps(m2, m3));
+        __m128 hi = _mm256_extractf128_ps(m0, 1);
+        __m128 lo = _mm256_castps256_ps128(m0);
+        __m128 mh = _mm_max_ps(hi, lo);
+        mh = _mm_max_ps(mh, _mm_movehl_ps(mh, mh));
+        mh = _mm_max_ps(mh, _mm_shuffle_ps(mh, mh, 1));
+        const float amax = _mm_cvtss_f32(mh);
+
+        if (amax == 0.0f) {
+            y[i].d = 0.0f;
+            std::memset(y[i].qs, 0, QK_K);
+            x += QK_K;
+            continue;
+        }
+        if (!(amax <= std::numeric_limits<float>::max())) {
+            iq_cpu_quant(GGML_TYPE_Q8_K, x, QK_K, y + i);
+            x += QK_K;
+            continue;
+        }
+        const __m256 vamax = _mm256_set1_ps(amax);
+        float max = 0.0f;
+        for (int j = 0; j < QK_K; j += 8) {
+            __m256 ax = _mm256_and_ps(_mm256_loadu_ps(x + j), vabs);
+            int m = _mm256_movemask_ps(_mm256_cmp_ps(ax, vamax, _CMP_EQ_OQ));
+            if (m) {
+                max = x[j + __builtin_ctz(m)];
+                break;
+            }
+        }
+        const float iscale = -127.f / max;
+        if (!std::isfinite(iscale)) {
+            iq_cpu_quant(GGML_TYPE_Q8_K, x, QK_K, y + i);
+            x += QK_K;
+            continue;
+        }
+        const __m256 viscale = _mm256_set1_ps(iscale);
+        for (int g = 0; g < QK_K / 16; ++g) {
+            const float* xg = x + g * 16;
+            __m256 p0 = _mm256_add_ps(_mm256_mul_ps(viscale, _mm256_loadu_ps(xg + 0)), vmagic);
+            __m256 p1 = _mm256_add_ps(_mm256_mul_ps(viscale, _mm256_loadu_ps(xg + 8)), vmagic);
+            __m256i i0 = _mm256_min_epi32(_mm256_sub_epi32(_mm256_and_si256(_mm256_castps_si256(p0), vmask), voff), v127);
+            __m256i i1 = _mm256_min_epi32(_mm256_sub_epi32(_mm256_and_si256(_mm256_castps_si256(p1), vmask), voff), v127);
+            __m128i p16_0 = _mm_packs_epi32(_mm256_castsi256_si128(i0), _mm256_extracti128_si256(i0, 1));
+            __m128i p16_1 = _mm_packs_epi32(_mm256_castsi256_si128(i1), _mm256_extracti128_si256(i1, 1));
+            _mm_storeu_si128((__m128i*) (y[i].qs + g * 16), _mm_packs_epi16(p16_0, p16_1));
+            __m128i s16 = _mm_add_epi32(_mm_madd_epi16(p16_0, vones16), _mm_madd_epi16(p16_1, vones16));
+            s16 = _mm_add_epi32(s16, _mm_shuffle_epi32(s16, 0x4e));
+            s16 = _mm_add_epi32(s16, _mm_shuffle_epi32(s16, 0xb1));
+            y[i].bsums[g] = (int16_t) _mm_cvtsi128_si32(s16);
+        }
+        y[i].d = 1.0f / iscale;
+        x += QK_K;
+    }
+}
+
+IQ_AVX2_NOFMA void sum_slots_avx2_impl(float* o, const float* const* ys, const float* ws, int nslots, int c0, int c1) {
+    int e = c0;
+    for (; e + 16 <= c1; e += 16) {
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        for (int sl = 0; sl < nslots; ++sl) {
+            const __m256 vw = _mm256_set1_ps(ws[sl]);
+            a0 = _mm256_add_ps(a0, _mm256_mul_ps(vw, _mm256_loadu_ps(ys[sl] + e)));
+            a1 = _mm256_add_ps(a1, _mm256_mul_ps(vw, _mm256_loadu_ps(ys[sl] + e + 8)));
+        }
+        _mm256_storeu_ps(o + e, a0);
+        _mm256_storeu_ps(o + e + 8, a1);
+    }
+    for (; e + 8 <= c1; e += 8) {
+        __m256 a0 = _mm256_setzero_ps();
+        for (int sl = 0; sl < nslots; ++sl) {
+            const __m256 vw = _mm256_set1_ps(ws[sl]);
+            a0 = _mm256_add_ps(a0, _mm256_mul_ps(vw, _mm256_loadu_ps(ys[sl] + e)));
+        }
+        _mm256_storeu_ps(o + e, a0);
+    }
+    for (; e < c1; ++e) {
+        float acc = 0.0f;
+        for (int sl = 0; sl < nslots; ++sl) acc += ws[sl] * ys[sl][e];
+        o[e] = acc;
+    }
+}
+
+IQ_AVX2_NOFMA void add_helpers_avx2_impl(float* o, const float* const* ys, int cnt, bool has_cpu, int c0, int c1) {
+    int e = c0;
+    for (; e + 16 <= c1; e += 16) {
+        __m256 a0, a1;
+        int k0 = 0;
+        if (has_cpu) {
+            a0 = _mm256_loadu_ps(o + e);
+            a1 = _mm256_loadu_ps(o + e + 8);
+        } else {
+            a0 = _mm256_loadu_ps(ys[0] + e);
+            a1 = _mm256_loadu_ps(ys[0] + e + 8);
+            k0 = 1;
+        }
+        for (int k = k0; k < cnt; ++k) {
+            a0 = _mm256_add_ps(a0, _mm256_loadu_ps(ys[k] + e));
+            a1 = _mm256_add_ps(a1, _mm256_loadu_ps(ys[k] + e + 8));
+        }
+        _mm256_storeu_ps(o + e, a0);
+        _mm256_storeu_ps(o + e + 8, a1);
+    }
+    for (; e + 8 <= c1; e += 8) {
+        __m256 a0 = has_cpu ? _mm256_loadu_ps(o + e) : _mm256_loadu_ps(ys[0] + e);
+        for (int k = has_cpu ? 0 : 1; k < cnt; ++k) a0 = _mm256_add_ps(a0, _mm256_loadu_ps(ys[k] + e));
+        _mm256_storeu_ps(o + e, a0);
+    }
+    for (; e < c1; ++e) {
+        float acc = has_cpu ? o[e] : ys[0][e];
+        for (int k = has_cpu ? 0 : 1; k < cnt; ++k) acc += ys[k][e];
+        o[e] = acc;
+    }
+}
+#endif
+
+void iq_cpu_quant_q8k_avx2(const float* x, int nb, void* dst) {
+#if defined(IQ_X86)
+    if (isa().avx2 && nb > 0) {
+        quant_q8k_avx2_blocks(x, (block_q8_K*) dst, nb);
+        return;
+    }
+#endif
+    if (nb > 0) iq_cpu_quant(GGML_TYPE_Q8_K, x, nb * QK_K, dst);
+}
+
+void iq_cpu_sum_slots_avx2(float* o, const float* const* ys, const float* ws, int nslots, int c0, int c1) {
+#if defined(IQ_X86)
+    if (isa().avx2) {
+        sum_slots_avx2_impl(o, ys, ws, nslots, c0, c1);
+        return;
+    }
+#endif
+    for (int e = c0; e < c1; ++e) o[e] = 0.0f;
+    for (int sl = 0; sl < nslots; ++sl) {
+        const float w = ws[sl];
+        const float* y = ys[sl];
+        for (int e = c0; e < c1; ++e) o[e] += w * y[e];
+    }
+}
+
+void iq_cpu_add_helpers_avx2(float* o, const float* const* ys, int cnt, bool has_cpu, int c0, int c1) {
+#if defined(IQ_X86)
+    if (isa().avx2) {
+        add_helpers_avx2_impl(o, ys, cnt, has_cpu, c0, c1);
+        return;
+    }
+#endif
+    if (has_cpu) {
+        for (int k = 0; k < cnt; ++k) {
+            const float* y = ys[k];
+            for (int e = c0; e < c1; ++e) o[e] += y[e];
+        }
+    } else {
+        for (int e = c0; e < c1; ++e) o[e] = ys[0][e];
+        for (int k = 1; k < cnt; ++k) {
+            const float* y = ys[k];
+            for (int e = c0; e < c1; ++e) o[e] += y[e];
+        }
+    }
+}
+
 bool iq_cpu_fmt(int tg, int td, int n_embd, int n_ff, IqCpu& f, std::string& err) {
     kc::NativeFmt n;
     if (!kc::native_fmt(tg, td, n_embd, n_ff, n, err)) return false;
@@ -2073,6 +2254,9 @@ bool iq_cpu_fmt(int, int, int, int, IqCpu&, std::string& err) {
 }
 void iq_cpu_prepare_rows(int) {}
 void iq_cpu_quant(int, const float*, int, void*) {}
+void iq_cpu_quant_q8k_avx2(const float*, int, void*) {}
+void iq_cpu_sum_slots_avx2(float*, const float* const*, const float*, int, int, int) {}
+void iq_cpu_add_helpers_avx2(float*, const float* const*, int, bool, int, int) {}
 void iq_cpu_gate_up(const IqCpu&, const uint8_t*, const uint8_t*, const void* const*, int, float* const*, int, int,
                     float) {}
 void iq_cpu_down(const IqCpu&, const uint8_t*, const void* const*, int, float* const*, int, int) {}
