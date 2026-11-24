@@ -2379,7 +2379,7 @@ __device__ __forceinline__ int attn_tile_offset(int row, int col) {
     return row * 512 + col;
 }
 
-template <int G>
+template <int G, bool Swizzle = false>
 __global__ void __launch_bounds__(kThreads) sparse_attn_bf16_g_kernel(
     const float* __restrict__ q, const uint16_t* __restrict__ win, const uint16_t* __restrict__ ckv,
     int sel_stride, AttnRows ar, const float* __restrict__ sink, int heads, float scale, float* __restrict__ out) {
@@ -2425,15 +2425,15 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_bf16_g_kernel(
                 const uint16_t* rr = j < n_win ? wbase + (size_t) j * d : cbase + (size_t) (j - n_win) * d;
                 const uint4 a0 = *(const uint4*) (rr + lane * 8);
                 const uint4 a1 = *(const uint4*) (rr + 256 + lane * 8);
-                *(uint4*) (tile + attn_tile_offset<false>(r, lane * 8)) = a0;
-                *(uint4*) (tile + attn_tile_offset<false>(r, 256 + lane * 8)) = a1;
+                *(uint4*) (tile + attn_tile_offset<Swizzle>(r, lane * 8)) = a0;
+                *(uint4*) (tile + attn_tile_offset<Swizzle>(r, 256 + lane * 8)) = a1;
             }
         }
         __syncthreads();
 #pragma unroll 2
         for (int r = wr; r < nt; r += W) {
-            const uint4 a = *(const uint4*) (tile + attn_tile_offset<false>(r, lane * 16));
-            const uint4 b = *(const uint4*) (tile + attn_tile_offset<false>(r, lane * 16 + 8));
+            const uint4 a = *(const uint4*) (tile + attn_tile_offset<Swizzle>(r, lane * 16));
+            const uint4 b = *(const uint4*) (tile + attn_tile_offset<Swizzle>(r, lane * 16 + 8));
             const uint16_t* pa = (const uint16_t*) &a;
             const uint16_t* pb = (const uint16_t*) &b;
             float s = 0.0f;
@@ -2475,7 +2475,7 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_bf16_g_kernel(
         }
 #pragma unroll 8
         for (int r = 0; r < nt; ++r) {
-            const uint32_t pr = *(const uint32_t*) (tile + attn_tile_offset<false>(r, c));
+            const uint32_t pr = *(const uint32_t*) (tile + attn_tile_offset<Swizzle>(r, c));
             const float v0 = bf16f((uint16_t) (pr & 0xffffu)), v1 = bf16f((uint16_t) (pr >> 16));
 #pragma unroll
             for (int g = 0; g < G; ++g) {
@@ -2492,6 +2492,235 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_bf16_g_kernel(
         ov[c] = o0[g] / den;
         ov[c + 1] = o1[g] / den;
     }
+}
+
+__device__ __forceinline__ float p5d_bf16_lo(uint32_t u) { return __uint_as_float(u << 16); }
+__device__ __forceinline__ float p5d_bf16_hi(uint32_t u) { return __uint_as_float(u & 0xffff0000u); }
+
+// G=1 partial SMEM tile (48 rows = 48 KB dynamic SMEM + 272 B static -> 2 CTAs/SM on sm_120)
+__global__ void __launch_bounds__(kThreads) sparse_attn_bf16_g1_tile48_kernel(
+    const float* __restrict__ q, const uint16_t* __restrict__ win, const uint16_t* __restrict__ ckv,
+    int sel_stride, AttnRows ar, const float* __restrict__ sink, int heads, float scale, float* __restrict__ out) {
+    pdl_wait();
+    pdl_trigger();
+    static_assert(kAttTile == 64, "kAttTile must be 64");
+    constexpr int d = 512, kSmemRows = 48;
+    const int hb = blockIdx.x, t = blockIdx.y;
+    int n_win, n_sel, w0;
+    if (ar.gen) {
+        const long long ta = ar.t0 + t, pa = ar.p0 + ta;
+        const long long first = max((long long) ar.win - ar.p0, ta + 1);
+        w0 = (int) first;
+        n_win = (int) (ar.win + ta - first + 1);
+        n_sel = ar.R > 0 ? (int) min((long long) ar.kcap, (pa + 1) / ar.R) : 0;
+    } else {
+        n_win = ar.nwin[t], n_sel = ar.nsel[t], w0 = ar.win0[t];
+    }
+    const uint16_t* wbase = win + (size_t) w0 * d;
+    const uint16_t* cbase = ckv + (size_t) t * sel_stride * d;
+    extern __shared__ __align__(16) uint16_t tile[];
+    __shared__ float sc[kAttTile];
+    __shared__ float m_run_s, tile_scale_s, den_s;
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+    float qr[16];
+#pragma unroll
+    for (int x = 0; x < 16; ++x) qr[x] = q[((size_t) t * heads + hb) * d + lane * 16 + x];
+    if (threadIdx.x == 0) {
+        m_run_s = -1e30f;
+        den_s = 0.0f;
+    }
+    float o0 = 0.0f, o1 = 0.0f;
+    const int c = (int) threadIdx.x * 2;
+    const int total = n_win + n_sel;
+    if (total == 0) __syncthreads();
+    for (int t0 = 0; t0 < total; t0 += kAttTile) {
+        const int nt = min(kAttTile, total - t0);
+        const int ns = min(kSmemRows, nt);
+        for (int r0 = 0; r0 < ns; r0 += 8) {
+            const int r = r0 + wp;
+            if (r < ns) {
+                const int j = t0 + r;
+                const uint16_t* rr = j < n_win ? wbase + (size_t) j * d : cbase + (size_t) (j - n_win) * d;
+                const uint4 a0 = *(const uint4*) (rr + lane * 8);
+                const uint4 a1 = *(const uint4*) (rr + 256 + lane * 8);
+                *(uint4*) (tile + attn_tile_offset<true>(r, lane * 8)) = a0;
+                *(uint4*) (tile + attn_tile_offset<true>(r, 256 + lane * 8)) = a1;
+            }
+        }
+        __syncthreads();
+        for (int r = wp; r < nt; r += 8) {
+            uint4 a, b;
+            if (r < ns) {
+                a = *(const uint4*) (tile + attn_tile_offset<true>(r, lane * 16));
+                b = *(const uint4*) (tile + attn_tile_offset<true>(r, lane * 16 + 8));
+            } else {
+                const int j = t0 + r;
+                const uint16_t* rr = j < n_win ? wbase + (size_t) j * d : cbase + (size_t) (j - n_win) * d;
+                a = *(const uint4*) (rr + lane * 16);
+                b = *(const uint4*) (rr + lane * 16 + 8);
+            }
+            const uint32_t* pa = (const uint32_t*) &a;
+            const uint32_t* pb = (const uint32_t*) &b;
+            float s = 0.0f;
+#pragma unroll
+            for (int x = 0; x < 4; ++x) {
+                s += qr[2 * x] * p5d_bf16_lo(pa[x]);
+                s += qr[2 * x + 1] * p5d_bf16_hi(pa[x]);
+            }
+#pragma unroll
+            for (int x = 0; x < 4; ++x) {
+                s += qr[8 + 2 * x] * p5d_bf16_lo(pb[x]);
+                s += qr[8 + 2 * x + 1] * p5d_bf16_hi(pb[x]);
+            }
+            s = warp_sum(s);
+            if (lane == 0) sc[r] = s * scale;
+        }
+        __syncthreads();
+        if (wp == 0) {
+            float m = -INFINITY;
+            for (int j = lane; j < nt; j += 32) m = fmaxf(m, sc[j]);
+            m = warp_max(m);
+            const float m_old = m_run_s;
+            const float m_new = fmaxf(m_old, m);
+            float s = 0.0f;
+            for (int j = lane; j < nt; j += 32) {
+                const float p = expf(sc[j] - m_new);
+                sc[j] = p;
+                s += p;
+            }
+            s = warp_sum(s);
+            __syncwarp();
+            if (lane == 0) {
+                tile_scale_s = expf(m_old - m_new);
+                den_s = den_s * tile_scale_s + s;
+                m_run_s = m_new;
+            }
+        }
+        __syncthreads();
+        const float cs = tile_scale_s;
+        o0 *= cs;
+        o1 *= cs;
+#pragma unroll 8
+        for (int r = 0; r < ns; ++r) {
+            const uint32_t pr = *(const uint32_t*) (tile + attn_tile_offset<true>(r, c));
+            o0 += sc[r] * p5d_bf16_lo(pr);
+            o1 += sc[r] * p5d_bf16_hi(pr);
+        }
+        for (int r = ns; r < nt; ++r) {
+            const int j = t0 + r;
+            const uint16_t* rr = j < n_win ? wbase + (size_t) j * d : cbase + (size_t) (j - n_win) * d;
+            const uint32_t pr = *(const uint32_t*) (rr + c);
+            o0 += sc[r] * p5d_bf16_lo(pr);
+            o1 += sc[r] * p5d_bf16_hi(pr);
+        }
+        __syncthreads();
+    }
+    const float den = den_s + expf(sink[hb] - m_run_s);
+    float* ov = out + ((size_t) t * heads + hb) * d;
+    ov[c] = o0 / den;
+    ov[c + 1] = o1 / den;
+}
+
+// G=1 zero-dynamic-SMEM kernel (62 regs -> 4 CTAs/SM -> 1 wave at T=6,7)
+__global__ void __launch_bounds__(kThreads) sparse_attn_bf16_g1_nosmem_kernel(
+    const float* __restrict__ q, const uint16_t* __restrict__ win, const uint16_t* __restrict__ ckv,
+    int sel_stride, AttnRows ar, const float* __restrict__ sink, int heads, float scale, float* __restrict__ out) {
+    pdl_wait();
+    pdl_trigger();
+    static_assert(kAttTile == 64, "kAttTile must be 64");
+    constexpr int d = 512, W = 8;
+    const int hb = blockIdx.x, t = blockIdx.y;
+    int n_win, n_sel, w0;
+    if (ar.gen) {
+        const long long ta = ar.t0 + t, pa = ar.p0 + ta;
+        const long long first = max((long long) ar.win - ar.p0, ta + 1);
+        w0 = (int) first;
+        n_win = (int) (ar.win + ta - first + 1);
+        n_sel = ar.R > 0 ? (int) min((long long) ar.kcap, (pa + 1) / ar.R) : 0;
+    } else {
+        n_win = ar.nwin[t], n_sel = ar.nsel[t], w0 = ar.win0[t];
+    }
+    const uint16_t* wbase = win + (size_t) w0 * d;
+    const uint16_t* cbase = ckv + (size_t) t * sel_stride * d;
+    __shared__ float sc[kAttTile];
+    __shared__ float m_run_s, tile_scale_s, den_s;
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+    float qr[16];
+#pragma unroll
+    for (int x = 0; x < 16; ++x) qr[x] = q[((size_t) t * heads + hb) * d + lane * 16 + x];
+    if (threadIdx.x == 0) {
+        m_run_s = -1e30f;
+        den_s = 0.0f;
+    }
+    float o0 = 0.0f, o1 = 0.0f;
+    const int c = (int) threadIdx.x * 2;
+    const int total = n_win + n_sel;
+    if (total == 0) __syncthreads();
+    for (int t0 = 0; t0 < total; t0 += kAttTile) {
+        const int nt = min(kAttTile, total - t0);
+        for (int k = 0; k < 8; ++k) {
+            const int r = wp + k * W;
+            if (r < nt) {
+                const int j = t0 + r;
+                const uint16_t* rr = j < n_win ? wbase + (size_t) j * d : cbase + (size_t) (j - n_win) * d;
+                const uint4 a = *(const uint4*) (rr + lane * 16);
+                const uint4 b = *(const uint4*) (rr + lane * 16 + 8);
+                const uint32_t* pa = (const uint32_t*) &a;
+                const uint32_t* pb = (const uint32_t*) &b;
+                float s = 0.0f;
+#pragma unroll
+                for (int x = 0; x < 4; ++x) {
+                    s += qr[2 * x] * p5d_bf16_lo(pa[x]);
+                    s += qr[2 * x + 1] * p5d_bf16_hi(pa[x]);
+                }
+#pragma unroll
+                for (int x = 0; x < 4; ++x) {
+                    s += qr[8 + 2 * x] * p5d_bf16_lo(pb[x]);
+                    s += qr[8 + 2 * x + 1] * p5d_bf16_hi(pb[x]);
+                }
+                s = warp_sum(s);
+                if (lane == 0) sc[r] = s * scale;
+            }
+        }
+        __syncthreads();
+        if (wp == 0) {
+            float m = -INFINITY;
+            for (int j = lane; j < nt; j += 32) m = fmaxf(m, sc[j]);
+            m = warp_max(m);
+            const float m_old = m_run_s;
+            const float m_new = fmaxf(m_old, m);
+            float s = 0.0f;
+            for (int j = lane; j < nt; j += 32) {
+                const float p = expf(sc[j] - m_new);
+                sc[j] = p;
+                s += p;
+            }
+            s = warp_sum(s);
+            __syncwarp();
+            if (lane == 0) {
+                tile_scale_s = expf(m_old - m_new);
+                den_s = den_s * tile_scale_s + s;
+                m_run_s = m_new;
+            }
+        }
+        __syncthreads();
+        const float cs = tile_scale_s;
+        o0 *= cs;
+        o1 *= cs;
+#pragma unroll 8
+        for (int r = 0; r < nt; ++r) {
+            const int j = t0 + r;
+            const uint16_t* rr = j < n_win ? wbase + (size_t) j * d : cbase + (size_t) (j - n_win) * d;
+            const uint32_t pr = *(const uint32_t*) (rr + c);
+            o0 += sc[r] * p5d_bf16_lo(pr);
+            o1 += sc[r] * p5d_bf16_hi(pr);
+        }
+        __syncthreads();
+    }
+    const float den = den_s + expf(sink[hb] - m_run_s);
+    float* ov = out + ((size_t) t * heads + hb) * d;
+    ov[c] = o0 / den;
+    ov[c + 1] = o1 / den;
 }
 
 template <int G, bool Swizzle = false>
@@ -5626,7 +5855,7 @@ bool attn_few(int T, int sel_stride, const AttnScratch* scr) {
 
 void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
                  const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
-                 int ckv_fmt, int heads_per_block, const AttnScratch* scr, bool fast) {
+                 int ckv_fmt, int heads_per_block, const AttnScratch* scr, bool fast, bool g1_fast) {
     if (d != 512 || (ckv_fmt != kKvFp4 && ckv_fmt != kKvBf16)) {
         std::fprintf(stderr, "ds4 sparse_attn: head dim %d (rows %d) not covered\n", d, ckv_fmt);
         return;
@@ -5674,6 +5903,31 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
             pdl_launch(unpack_sel_kernel, dim3(cdiv(sel_stride, kStage), T), kThreads, 0, s, (const uint8_t*) ckv, sel,
                        sel_stride, a, scr->cap, scr->rows);
 #if !defined(MAYA_USE_HIP)
+        if (g1_fast && heads >= 1) {
+            if (T <= 2) {
+                constexpr int kDyn = kAttTile * 512 * (int) sizeof(uint16_t);
+                static const bool attr1 =
+                    (cudaFuncSetAttribute(sparse_attn_bf16_g_kernel<1, true>,
+                                          cudaFuncAttributeMaxDynamicSharedMemorySize, kDyn) == cudaSuccess);
+                (void) attr1;
+                pdl_launch(sparse_attn_bf16_g_kernel<1, true>, dim3(heads, T), kThreads, kDyn, s, q, win, scr->rows,
+                           scr->cap, a, sink, heads, scale, out);
+                return;
+            }
+            if (T <= 5) {
+                constexpr int kDyn48 = 48 * 512 * (int) sizeof(uint16_t);
+                static const bool attr48 =
+                    (cudaFuncSetAttribute(sparse_attn_bf16_g1_tile48_kernel,
+                                          cudaFuncAttributeMaxDynamicSharedMemorySize, kDyn48) == cudaSuccess);
+                (void) attr48;
+                pdl_launch(sparse_attn_bf16_g1_tile48_kernel, dim3(heads, T), kThreads, kDyn48, s, q, win, scr->rows,
+                           scr->cap, a, sink, heads, scale, out);
+                return;
+            }
+            pdl_launch(sparse_attn_bf16_g1_nosmem_kernel, dim3(heads, T), kThreads, 0, s, q, win, scr->rows,
+                       scr->cap, a, sink, heads, scale, out);
+            return;
+        }
         if (fast && T > 1 && heads % 2 == 0) {
             constexpr int kDyn = kAttTile * 512 * (int) sizeof(uint16_t);
             static const bool attr2 =

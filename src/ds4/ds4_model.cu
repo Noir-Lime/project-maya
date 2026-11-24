@@ -23539,7 +23539,7 @@ struct Model::Impl {
         }
         if (NHL > 0) {
             sparse_attn(q, d.ext, ckv, topk_r, (int) topk_stride(), ar, l.sink, NHL, HD, T,
-                        1.0f / std::sqrt((float) HD), o_r, s, ckv_fmt, 0, &d.attn_scr, true);
+                        1.0f / std::sqrt((float) HD), o_r, s, ckv_fmt, 0, &d.attn_scr, true, true);
             Finish fo;
             fo.rd = g.rd;
             fo.pos = (int) p0;
