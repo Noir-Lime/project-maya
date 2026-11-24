@@ -18,6 +18,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cfloat>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -4027,6 +4029,79 @@ __global__ void __launch_bounds__(256) helper_take_kernel(const Req* req, unsign
     }
 }
 
+__global__ void __launch_bounds__(256) helper_take_fast_kernel(const Req* req, unsigned seq, int k, int dim,
+                                                               const unsigned long long* __restrict__ tab, int n,
+                                                               unsigned long long* plan, float* w, float* x,
+                                                               unsigned* ack, const unsigned* quit) {
+    static_assert(offsetof(Req, x) % 16 == 0, "Req::x must be 16-byte aligned");
+    static_assert((kMaxDim & 3) == 0, "Req::kMaxDim must be a multiple of 4");
+    __shared__ int live;
+    if (threadIdx.x == 0) {
+        unsigned v;
+        while ((int) ((v = *(volatile const unsigned*) &req->seq) - seq) < 0 && *(volatile const unsigned*) quit == 0u) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            __nanosleep(200);
+#endif
+        }
+        __threadfence_system();
+        live = v == seq;
+    }
+    __syncthreads();
+    const volatile Req* r = req;
+    const int T = live ? min(max(r->T, 1), kWin) : 0;
+    for (int j = threadIdx.x; j < kWin * kPicks; j += blockDim.x) {
+        const int t = j / kPicks, i = j % kPicks;
+        unsigned long long p = 0ull;
+        float wv = 0.0f;
+        if (t < T && i < k) {
+            const int e = r->ids[t][i];
+            wv = r->w[t][i];
+            if (e >= 0 && e < n) p = tab[e];
+        }
+        plan[j] = p;
+        w[j] = p != 0ull ? wv : 0.0f;
+    }
+    if (T > 0) {
+        if ((((uintptr_t) &req->x[0][0] | (uintptr_t) x) & 15u) == 0u && (dim & 3) == 0) {
+            const int d4 = dim >> 2;
+            const int n4 = T * d4;
+            constexpr int kBatch = 8;
+            float4* const dx = (float4*) x;
+            for (int base = 0; base < n4; base += kBatch * 256) {
+                float4 v[kBatch];
+                int dst_idx[kBatch];
+                #pragma unroll
+                for (int u = 0; u < kBatch; ++u) {
+                    const int idx = base + u * 256 + (int) threadIdx.x;
+                    dst_idx[u] = idx;
+                    if (idx < n4) {
+                        const int t = T == 1 ? 0 : (int) ((unsigned) idx / (unsigned) d4);
+                        const int c4 = T == 1 ? idx : idx - t * d4;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 350 && !defined(MAYA_USE_HIP)
+                        v[u] = __ldcv((const float4*) req->x[t] + c4);
+#else
+                        const volatile float4* vp = (const volatile float4*) req->x[t] + c4;
+                        v[u] = make_float4(vp->x, vp->y, vp->z, vp->w);
+#endif
+                    }
+                }
+                #pragma unroll
+                for (int u = 0; u < kBatch; ++u) {
+                    const int idx = dst_idx[u];
+                    if (idx < n4) dx[idx] = v[u];
+                }
+            }
+        } else {
+            for (int j = threadIdx.x; j < T * dim; j += blockDim.x) x[j] = r->x[j / dim][j % dim];
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0 && live) {
+        __threadfence_system();
+        *(volatile unsigned*) ack = seq;
+    }
+}
+
 __global__ void signal_seq_kernel(unsigned* flag, unsigned seq) {
     __threadfence_system();
     *(volatile unsigned*) flag = seq;
@@ -4719,8 +4794,13 @@ bool route_pair(const RoutePair& a, cudaStream_t s, bool fast) {
 }
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s) { pdl_launch(wait_seq_kernel, 1, 32, 0, s, seq_ptr, seq); }
 void helper_take(const Req* req, unsigned seq, int k, int dim, const unsigned long long* tab, int n,
-                 unsigned long long* plan, float* w, float* x, unsigned* ack, const unsigned* quit, cudaStream_t s) {
-    helper_take_kernel<<<1, 256, 0, s>>>(req, seq, k, dim, tab, n, plan, w, x, ack, quit);
+                 unsigned long long* plan, float* w, float* x, unsigned* ack, const unsigned* quit, cudaStream_t s,
+                 bool fast) {
+    if (fast) {
+        helper_take_fast_kernel<<<1, 256, 0, s>>>(req, seq, k, dim, tab, n, plan, w, x, ack, quit);
+    } else {
+        helper_take_kernel<<<1, 256, 0, s>>>(req, seq, k, dim, tab, n, plan, w, x, ack, quit);
+    }
 }
 void signal_seq(unsigned* flag, unsigned seq, cudaStream_t s) { signal_seq_kernel<<<1, 1, 0, s>>>(flag, seq); }
 void init_pre(float* pre, int T, cudaStream_t s) { pdl_launch(init_pre_kernel, cdiv(T * 8, 128), 128, 0, s, pre, T); }

@@ -15803,7 +15803,7 @@ struct Model::Impl {
         if (ok) {
             const size_t D = (size_t) g.dim;
             helper_take(reqs + slot, sq, l.k_exp, g.dim, htab_of(l, H), l.n_exp, H.plan, H.w, H.x,
-                        H.flags + slot, H.flags + 2 * kRing, H.st);
+                        H.flags + slot, H.flags + 2 * kRing, H.st, true);
             if (rh_serve) rh_mark(0);
             if (T > 1 && !tokens) {
                 gf::MoeWin mw;
