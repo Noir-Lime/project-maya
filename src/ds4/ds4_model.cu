@@ -15936,7 +15936,7 @@ struct Model::Impl {
                 wa.n_embd = g.dim;
                 wa.n_ff = g.ff;
                 wa.limit = g.lim;   // (no CPU part, no shared expert, no wait: the helper's sums alone)
-                ok = l.lay.fmt == gg::kFmtMXFP4 ? gg::win_experts(wa, H.st) : x3::win_experts(wa, H.st);
+                ok = l.lay.fmt == gg::kFmtMXFP4 ? gg::win_experts(wa, H.st, true) : x3::win_experts(wa, H.st);
             }
             for (int t = 0; ok && (T == 1 || tokens) && t < T; ++t) {
                 x3::MoeArgs ma;
@@ -15950,7 +15950,7 @@ struct Model::Impl {
                 ma.limit = g.lim;
                 if (l.lay.fmt == gg::kFmtMXFP4) {
                     gg::moe_gate_up(ma, H.x + (size_t) t * D, H.h, H.st);
-                    gg::moe_down(ma, H.h, nullptr, (rh_dout != nullptr ? rh_dout + (size_t) t * D : H.res + ((size_t) slot * kWin + (size_t) t) * D), H.st);
+                    gg::moe_down(ma, H.h, nullptr, (rh_dout != nullptr ? rh_dout + (size_t) t * D : H.res + ((size_t) slot * kWin + (size_t) t) * D), H.st, true);
                 } else {
                     x3::moe_gate_up(ma, H.x + (size_t) t * D, H.h, H.st);
                     x3::moe_down(ma, H.h, nullptr, (rh_dout != nullptr ? rh_dout + (size_t) t * D : H.res + ((size_t) slot * kWin + (size_t) t) * D), H.st);
