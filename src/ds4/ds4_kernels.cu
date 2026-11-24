@@ -814,6 +814,116 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_rows_kernel(const TW* __res
 // kGemvT tokens (blockIdx.y) - so each (token, row) the rows kernel's bits, the one-token kernel's.  The old kernel
 // stays as it is: route_fuse_check (ds4_model.cu) compares the two
 template <typename TW>
+__device__ __forceinline__ float gate_row4_b2(const TW* __restrict__ w, const float4* __restrict__ xv, int k4, int lane) {
+    float acc = 0.0f;
+    int c = lane;
+    for (; c + 96 < k4; c += 128) {
+        const float4 a0 = gate_ld(w, c);
+        const float4 a1 = gate_ld(w, c + 32);
+        const float4 a2 = gate_ld(w, c + 64);
+        const float4 a3 = gate_ld(w, c + 96);
+        const float4 b0 = xv[c], b1 = xv[c + 32], b2 = xv[c + 64], b3 = xv[c + 96];
+        acc = fmaf(a0.x, b0.x, acc); acc = fmaf(a0.y, b0.y, acc); acc = fmaf(a0.z, b0.z, acc); acc = fmaf(a0.w, b0.w, acc);
+        acc = fmaf(a1.x, b1.x, acc); acc = fmaf(a1.y, b1.y, acc); acc = fmaf(a1.z, b1.z, acc); acc = fmaf(a1.w, b1.w, acc);
+        acc = fmaf(a2.x, b2.x, acc); acc = fmaf(a2.y, b2.y, acc); acc = fmaf(a2.z, b2.z, acc); acc = fmaf(a2.w, b2.w, acc);
+        acc = fmaf(a3.x, b3.x, acc); acc = fmaf(a3.y, b3.y, acc); acc = fmaf(a3.z, b3.z, acc); acc = fmaf(a3.w, b3.w, acc);
+    }
+    for (; c < k4; c += 32) {
+        const float4 a = gate_ld(w, c), b = xv[c];
+        acc = fmaf(a.x, b.x, acc); acc = fmaf(a.y, b.y, acc); acc = fmaf(a.z, b.z, acc); acc = fmaf(a.w, b.w, acc);
+    }
+    return warp_sum(acc);
+}
+template <typename TW, int KW>
+__global__ void __launch_bounds__(KW * 32) gemv_f32_pair_fast_kernel(const TW* __restrict__ W0, int n0,
+                                                                      float* __restrict__ y0, const TW* __restrict__ W1,
+                                                                      int n1, float* __restrict__ y1,
+                                                                      const float* __restrict__ x, int k) {
+    const int b0 = (n0 + KW - 1) / KW;
+    const bool second = (int) blockIdx.x >= b0;
+    const TW* W = second ? W1 : W0;
+    const int n = second ? n1 : n0;
+    float* y = second ? y1 : y0;
+    const int row = ((int) blockIdx.x - (second ? b0 : 0)) * KW + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (row >= n) return;
+    const float acc = gate_row4_b2(W + (size_t) row * k, (const float4*) x, k / 4, lane);
+    if (lane == 0) y[row] = acc;
+}
+template <typename TW, int NT, int KW>
+__global__ void __launch_bounds__(KW * 32) gemv_f32_pair_rows_fast_kernel(
+    const TW* __restrict__ W0, int n0, float* __restrict__ y0, const TW* __restrict__ W1, int n1,
+    float* __restrict__ y1, const float* __restrict__ x, int k, int ldy) {
+    __shared__ float4 xs[NT][128];
+    const int b0 = (n0 + KW - 1) / KW;
+    const bool second = (int) blockIdx.x >= b0;
+    const TW* W = second ? W1 : W0;
+    const int n = second ? n1 : n0;
+    float* y = second ? y1 : y0;
+    const int row = ((int) blockIdx.x - (second ? b0 : 0)) * KW + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31, k4 = k / 4;
+    const TW* w = W + (size_t) min(row, n - 1) * k;
+    float acc[NT];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t] = 0.0f;
+    for (int c0 = 0; c0 < k4; c0 += 128) {
+        const int nc = min(128, k4 - c0);
+        __syncthreads();
+        for (int i = (int) threadIdx.x; i < NT * 128; i += KW * 32) {
+            const int t = i / 128, c = i & 127;
+            if (c < nc) xs[t][c] = ((const float4*) (x + (size_t) t * k))[c0 + c];
+        }
+        __syncthreads();
+        if (nc == 128) {
+            const float4 a0 = gate_ld(w, c0 + lane);
+            const float4 a1 = gate_ld(w, c0 + lane + 32);
+            const float4 a2 = gate_ld(w, c0 + lane + 64);
+            const float4 a3 = gate_ld(w, c0 + lane + 96);
+#pragma unroll
+            for (int t = 0; t < NT; ++t) {
+                const float4 b = xs[t][lane];
+                acc[t] = fmaf(a0.x, b.x, acc[t]); acc[t] = fmaf(a0.y, b.y, acc[t]);
+                acc[t] = fmaf(a0.z, b.z, acc[t]); acc[t] = fmaf(a0.w, b.w, acc[t]);
+            }
+#pragma unroll
+            for (int t = 0; t < NT; ++t) {
+                const float4 b = xs[t][lane + 32];
+                acc[t] = fmaf(a1.x, b.x, acc[t]); acc[t] = fmaf(a1.y, b.y, acc[t]);
+                acc[t] = fmaf(a1.z, b.z, acc[t]); acc[t] = fmaf(a1.w, b.w, acc[t]);
+            }
+#pragma unroll
+            for (int t = 0; t < NT; ++t) {
+                const float4 b = xs[t][lane + 64];
+                acc[t] = fmaf(a2.x, b.x, acc[t]); acc[t] = fmaf(a2.y, b.y, acc[t]);
+                acc[t] = fmaf(a2.z, b.z, acc[t]); acc[t] = fmaf(a2.w, b.w, acc[t]);
+            }
+#pragma unroll
+            for (int t = 0; t < NT; ++t) {
+                const float4 b = xs[t][lane + 96];
+                acc[t] = fmaf(a3.x, b.x, acc[t]); acc[t] = fmaf(a3.y, b.y, acc[t]);
+                acc[t] = fmaf(a3.z, b.z, acc[t]); acc[t] = fmaf(a3.w, b.w, acc[t]);
+            }
+        } else {
+            for (int c = lane; c < nc; c += 32) {
+                const float4 a = gate_ld(w, c0 + c);
+#pragma unroll
+                for (int t = 0; t < NT; ++t) {
+                    const float4 b = xs[t][c];
+                    acc[t] = fmaf(a.x, b.x, acc[t]); acc[t] = fmaf(a.y, b.y, acc[t]);
+                    acc[t] = fmaf(a.z, b.z, acc[t]); acc[t] = fmaf(a.w, b.w, acc[t]);
+                }
+            }
+        }
+    }
+    if (row >= n) return;
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+        const float s = warp_sum(acc[t]);
+        if (lane == 0) y[(size_t) t * ldy + row] = s;
+    }
+}
+
+template <typename TW>
 __global__ void __launch_bounds__(kThreads) gemv_f32_pair_rows_kernel(const TW* __restrict__ W0, int n0,
                                                                       float* __restrict__ y0,
                                                                       const TW* __restrict__ W1, int n1,
@@ -4347,9 +4457,32 @@ void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, 
 
 template <typename TW>
 static bool gemv_f32_pair_t(const TW* W0, int n0, float* y0, const TW* W1, int n1, float* y1, const float* x, int k,
-                            cudaStream_t s, int T, int ldy) {
+                            cudaStream_t s, int T, int ldy, bool fast = false) {
     if (n0 < 1 || n1 < 1 || k < 4 || k % 4 != 0 || T < 1 || T > kWin || (T > 1 && ldy < std::max(n0, n1)))
         return false;
+    if (fast) {
+        constexpr int KW = 4;
+        const int bf0 = (int) cdiv(n0, KW), bf1 = (int) cdiv(n1, KW);
+        if (T == 1) {
+            gemv_f32_pair_fast_kernel<TW, KW><<<bf0 + bf1, KW * 32, 0, s>>>(W0, n0, y0, W1, n1, y1, x, k);
+            return cudaGetLastError() == cudaSuccess;
+        } else if (T == 2) {
+            gemv_f32_pair_rows_fast_kernel<TW, 2, KW><<<bf0 + bf1, KW * 32, 0, s>>>(W0, n0, y0, W1, n1, y1, x, k, ldy);
+            return cudaGetLastError() == cudaSuccess;
+        } else if (T == 3) {
+            gemv_f32_pair_rows_fast_kernel<TW, 3, KW><<<bf0 + bf1, KW * 32, 0, s>>>(W0, n0, y0, W1, n1, y1, x, k, ldy);
+            return cudaGetLastError() == cudaSuccess;
+        } else if (T == 4) {
+            gemv_f32_pair_rows_fast_kernel<TW, 4, KW><<<bf0 + bf1, KW * 32, 0, s>>>(W0, n0, y0, W1, n1, y1, x, k, ldy);
+            return cudaGetLastError() == cudaSuccess;
+        } else if (T == 5) {
+            gemv_f32_pair_rows_fast_kernel<TW, 5, KW><<<bf0 + bf1, KW * 32, 0, s>>>(W0, n0, y0, W1, n1, y1, x, k, ldy);
+            return cudaGetLastError() == cudaSuccess;
+        } else if (T == 6) {
+            gemv_f32_pair_rows_fast_kernel<TW, 6, KW><<<bf0 + bf1, KW * 32, 0, s>>>(W0, n0, y0, W1, n1, y1, x, k, ldy);
+            return cudaGetLastError() == cudaSuccess;
+        }
+    }
     const int b0 = (int) cdiv(n0, kThreads / 32), b1 = (int) cdiv(n1, kThreads / 32);
     if (T == 1) gemv_f32_pair_kernel<TW><<<b0 + b1, kThreads, 0, s>>>(W0, n0, y0, W1, n1, y1, x, k);
     else   // (=2, a window's rows)
@@ -4366,8 +4499,8 @@ static void gemv_f32_t(const TW* W, const float* x, int n, int k, int T, float* 
                    T, y, ldy);
 }
 bool gemv_f32_pair(const float* W0, int n0, float* y0, const float* W1, int n1, float* y1, const float* x, int k,
-                   cudaStream_t s, int T, int ldy) {
-    return gemv_f32_pair_t(W0, n0, y0, W1, n1, y1, x, k, s, T, ldy);
+                   cudaStream_t s, int T, int ldy, bool fast) {
+    return gemv_f32_pair_t(W0, n0, y0, W1, n1, y1, x, k, s, T, ldy, fast);
 }
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s) {
     gemv_f32_t(W, x, n, k, T, y, ldy, s);
@@ -4377,10 +4510,10 @@ void gemv_f32(GateW W, const float* x, int n, int k, int T, float* y, int ldy, c
     else gemv_f32_t(W.f, x, n, k, T, y, ldy, s);
 }
 bool gemv_f32_pair(GateW W0, int n0, float* y0, GateW W1, int n1, float* y1, const float* x, int k, cudaStream_t s,
-                   int T, int ldy) {
+                   int T, int ldy, bool fast) {
     if ((W0.h != nullptr) == (W1.h != nullptr))
-        return W0.h != nullptr ? gemv_f32_pair_t(W0.h, n0, y0, W1.h, n1, y1, x, k, s, T, ldy)
-                               : gemv_f32_pair_t(W0.f, n0, y0, W1.f, n1, y1, x, k, s, T, ldy);
+        return W0.h != nullptr ? gemv_f32_pair_t(W0.h, n0, y0, W1.h, n1, y1, x, k, s, T, ldy, fast)
+                               : gemv_f32_pair_t(W0.f, n0, y0, W1.f, n1, y1, x, k, s, T, ldy, fast);
     // (one router BF16, the other F32: each its own launch - a row's code and so its bits are the pair's)
     if (n0 < 1 || n1 < 1 || k < 4 || k % 4 != 0 || T < 1 || T > kWin || (T > 1 && ldy < std::max(n0, n1)))
         return false;
