@@ -3207,6 +3207,222 @@ __global__ void __launch_bounds__(512) route_pair_kernel(const RoutePair a) {
     }
 }
 
+__device__ unsigned g_rp_done_v2 = 0u;
+
+__global__ void __launch_bounds__(64) route_pair_pub_1_kernel(const RoutePair a) {
+    __shared__ float sc[1024], bs[1024], bs_a[1024];
+    __shared__ int pick0[kPicks], on_cpu;
+    const int tid = (int) threadIdx.x, wp = tid >> 5, lane = tid & 31;
+    if (wp == 0) {
+        const int n = a.n, k = a.k;
+        const float* logits = a.logits;
+        const float* bias = (a.bias_vl != nullptr && (a.vl & 1u)) ? a.bias_vl : a.bias;
+        for (int i = lane; i < n; i += 32) {
+            const float l = logits[i];
+            const float sp = l > 20.0f ? l : log1pf(expf(l));
+            sc[i] = sqrtf(sp);
+            bs[i] = sc[i] + bias[i];
+        }
+        __syncwarp();
+        unsigned nf = 0u;
+        for (int r = 0; r < k; ++r) {
+            float best = -FLT_MAX;
+            int bix = 0x7fffffff;
+            for (int i = lane; i < n; i += 32)
+                if (bs[i] > best || (bs[i] == best && i < bix)) best = bs[i], bix = i;
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+                const int oi = __shfl_xor_sync(0xffffffffu, bix, o);
+                if (ov > best || (ov == best && oi < bix)) best = ov, bix = oi;
+            }
+            if (lane == 0) {
+                if (bix >= n) bix = 0, nf |= 1u << r;
+                pick0[r] = bix;
+                bs[bix] = -FLT_MAX;
+            }
+            __syncwarp();
+        }
+        if (lane == 0) {
+            float s = 0.0f;
+            for (int r = 0; r < k; ++r) s += ((nf >> r) & 1u) ? 0.0f : sc[pick0[r]];
+            int cpu = 0;
+            float sk;
+            const unsigned keep = route_keep(sc, pick0, k, s, a.rs_w, a.rs_k, sk) & ~nf;
+            for (int r = 0; r < k; ++r) {
+                const bool kept = (keep >> r) & 1u;
+                const float wv = kept ? sc[pick0[r]] / (sk + 1e-20f) * a.route_scale : 0.0f;
+                a.idx[r] = pick0[r];
+                a.w[r] = wv;
+                a.plan_ptr[r] = kept ? a.vram[pick0[r]] : 0ull;
+                cpu |= kept && a.vram[pick0[r]] == 0ull;
+                a.req->ids[0][r] = kept ? pick0[r] : -1;
+                a.req->w[0][r] = wv;
+            }
+            on_cpu = cpu;
+        }
+    } else {
+        const int n = a.a_n, m = a.m, off = a.off;
+        const float* logits = a.a_logits;
+        const float* bias = a.a_bias;
+        for (int i = lane; i < n; i += 32) {
+            const float l = logits[i];
+            const float sp = l > 20.0f ? l : log1pf(expf(l));
+            bs_a[i] = sqrtf(sp) + bias[i];
+        }
+        __syncwarp();
+        for (int r = 0; r < m; ++r) {
+            float best = -FLT_MAX;
+            int bix = 0x7fffffff;
+            for (int i = lane; i < n; i += 32)
+                if (bs_a[i] > best || (bs_a[i] == best && i < bix)) best = bs_a[i], bix = i;
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+                const int oi = __shfl_xor_sync(0xffffffffu, bix, o);
+                if (ov > best || (ov == best && oi < bix)) best = ov, bix = oi;
+            }
+            if (lane == 0) {
+                a.req->ahead[0][off + r] = bix < n ? bix : -1;
+                if (bix < n) bs_a[bix] = -FLT_MAX;
+            }
+            __syncwarp();
+        }
+    }
+    __syncthreads();
+    if (on_cpu) {
+        if ((((uintptr_t) a.x | (uintptr_t) a.req) & 15u) == 0 && (a.dim & 3) == 0) {
+            const int d4 = a.dim >> 2;
+            float4* dst4 = (float4*) a.req->x[0];
+            const float4* src4 = (const float4*) a.x;
+            for (int i = tid; i < d4; i += 64) dst4[i] = src4[i];
+        } else {
+            for (int i = tid; i < a.dim; i += 64) a.req->x[0][i] = a.x[i];
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        __threadfence_system();
+        a.req->na[0] = a.na0;
+        a.req->na[1] = a.na1;
+        a.req->T = 1;
+        __threadfence_system();
+        *(volatile unsigned*) &a.req->seq = a.seq;
+    }
+}
+
+__global__ void __launch_bounds__(256) route_pair_pub_rows_kernel(const RoutePair a) {
+    if (blockIdx.x == 0) {
+        __shared__ float sc[1024], bs[1024];
+        __shared__ int pick[kPicks];
+        __shared__ int on_cpu;
+        const int t = blockIdx.y, n = a.n, k = a.k;
+        const int tid = (int) threadIdx.x, lane = tid & 31, wp = tid >> 5;
+        const float* logits = a.logits + (size_t) t * 1024;
+        const float* bias = a.bias;
+        if (a.bias_vl != nullptr && ((a.vl >> t) & 1u)) bias = a.bias_vl;
+        for (int i = tid; i < n; i += 256) {
+            const float l = logits[i];
+            const float sp = l > 20.0f ? l : log1pf(expf(l));
+            sc[i] = sqrtf(sp);
+            bs[i] = sc[i] + bias[i];
+        }
+        __syncthreads();
+        if (wp == 0) {
+            unsigned nf = 0u;
+            for (int r = 0; r < k; ++r) {
+                float best = -FLT_MAX;
+                int bix = 0x7fffffff;
+                for (int i = lane; i < n; i += 32)
+                    if (bs[i] > best || (bs[i] == best && i < bix)) best = bs[i], bix = i;
+                for (int o = 16; o > 0; o >>= 1) {
+                    const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+                    const int oi = __shfl_xor_sync(0xffffffffu, bix, o);
+                    if (ov > best || (ov == best && oi < bix)) best = ov, bix = oi;
+                }
+                if (lane == 0) {
+                    if (bix >= n) bix = 0, nf |= 1u << r;
+                    pick[r] = bix;
+                    bs[bix] = -FLT_MAX;
+                }
+                __syncwarp();
+            }
+            if (lane == 0) {
+                float s = 0.0f;
+                for (int r = 0; r < k; ++r) s += ((nf >> r) & 1u) ? 0.0f : sc[pick[r]];
+                int cpu = 0;
+                float sk;
+                const unsigned keep = route_keep(sc, pick, k, s, a.rs_w, a.rs_k, sk) & ~nf;
+                for (int r = 0; r < k; ++r) {
+                    const bool kept = (keep >> r) & 1u;
+                    const float wv = kept ? sc[pick[r]] / (sk + 1e-20f) * a.route_scale : 0.0f;
+                    a.idx[(size_t) t * kPicks + r] = pick[r];
+                    a.w[(size_t) t * kPicks + r] = wv;
+                    a.plan_ptr[(size_t) t * kPicks + r] = kept ? a.vram[pick[r]] : 0ull;
+                    cpu |= kept && a.vram[pick[r]] == 0ull;
+                    a.req->ids[t][r] = kept ? pick[r] : -1;
+                    a.req->w[t][r] = wv;
+                }
+                on_cpu = cpu;
+            }
+        }
+        __syncthreads();
+        if (on_cpu) {
+            if ((((uintptr_t) a.x | (uintptr_t) a.req) & 15u) == 0 && (a.dim & 3) == 0) {
+                const int d4 = a.dim >> 2;
+                float4* dst4 = (float4*) a.req->x[t];
+                const float4* src4 = (const float4*) (a.x + (size_t) t * a.dim);
+                for (int i = tid; i < d4; i += 256) dst4[i] = src4[i];
+            } else {
+                for (int i = tid; i < a.dim; i += 256)
+                    a.req->x[t][i] = a.x[(size_t) t * a.dim + i];
+            }
+        }
+    } else {
+        __shared__ float bs[1024];
+        const int t = blockIdx.y, n = a.a_n, m = a.m, off = a.off;
+        const int tid = (int) threadIdx.x, lane = tid & 31, wp = tid >> 5;
+        const float* logits = a.a_logits + (size_t) t * 1024;
+        const float* bias = a.a_bias;
+        Req* req = a.req;
+        for (int i = tid; i < n; i += 256) {
+            const float l = logits[i];
+            const float sp = l > 20.0f ? l : log1pf(expf(l));
+            bs[i] = sqrtf(sp) + bias[i];
+        }
+        __syncthreads();
+        if (wp == 0) {
+            for (int r = 0; r < m; ++r) {
+                float best = -FLT_MAX;
+                int bix = 0x7fffffff;
+                for (int i = lane; i < n; i += 32)
+                    if (bs[i] > best || (bs[i] == best && i < bix)) best = bs[i], bix = i;
+                for (int o = 16; o > 0; o >>= 1) {
+                    const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+                    const int oi = __shfl_xor_sync(0xffffffffu, bix, o);
+                    if (ov > best || (ov == best && oi < bix)) best = ov, bix = oi;
+                }
+                if (lane == 0) {
+                    req->ahead[t][off + r] = bix < n ? bix : -1;
+                    if (bix < n) bs[bix] = -FLT_MAX;
+                }
+                __syncwarp();
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+        const unsigned tot = gridDim.x * gridDim.y;
+        if (atomicAdd(&g_rp_done_v2, 1u) + 1u == tot) {
+            g_rp_done_v2 = 0u;
+            a.req->na[0] = a.na0;
+            a.req->na[1] = a.na1;
+            a.req->T = a.T;
+            __threadfence_system();
+            *(volatile unsigned*) &a.req->seq = a.seq;
+        }
+    }
+}
+
 __global__ void publish_kernel(Req* req, int T, unsigned seq, int na0, int na1, Resp* resp, int* cpu_any,
                                const unsigned* host_done) {
     pdl_wait();
@@ -3947,13 +4163,18 @@ void route_ahead(const float* logits, const float* bias, int n, int m, int T, Re
     if (req != nullptr && m > 0 && T > 0 && n <= 1024 && off + m <= kAhead)
         pdl_launch(route_ahead_kernel, T, 512, 0, s, logits, bias, n, m, req, off);
 }
-bool route_pair(const RoutePair& a, cudaStream_t s) {
+bool route_pair(const RoutePair& a, cudaStream_t s, bool fast) {
     if (a.req == nullptr || a.n < 1 || a.n > 1024 || a.k < 1 || a.k > kPicks || a.a_n < 1 || a.a_n > 1024 || a.m < 1 ||
         a.off < 0 || a.off + a.m > kAhead || a.dim < 1 || a.dim > kMaxDim || a.T < 1 || a.T > kWin)
         return false;
     RoutePair b = a;
     const ResidentSkip rs = resident_skip();
     b.rs_w = rs.w, b.rs_k = rs.k;
+    if (fast) {
+        if (b.T == 1) route_pair_pub_1_kernel<<<1, 64, 0, s>>>(b);
+        else route_pair_pub_rows_kernel<<<dim3(2, (unsigned) b.T), 256, 0, s>>>(b);
+        return cudaGetLastError() == cudaSuccess;
+    }
     route_pair_kernel<<<dim3(2, (unsigned) b.T), 512, 0, s>>>(b);
     if (cudaGetLastError() != cudaSuccess) return false;   // (a routing that did not go in is never published)
     publish_kernel<<<1, 1, 0, s>>>(a.req, a.T, a.seq, a.na0, a.na1, nullptr, nullptr, nullptr);

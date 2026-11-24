@@ -23367,7 +23367,7 @@ struct Model::Impl {
             if (route_fusable(l, nx1, m1, D)) {   // (a GEMV not gone in reaches no routing; a routing, no publish)
                 if (!gemv_f32_pair(l.gate_w, l.n_exp, d.glog, nx1->gate_w, nx1->n_exp, d.glog_a, d.x, D, s, T,
                                    1024) ||
-                    !route_pair(rp, s)) {
+                    !route_pair(rp, s, true)) {
                     err = "the fused router stage: a launch did not go in";
                     return false;
                 }

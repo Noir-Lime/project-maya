@@ -419,7 +419,7 @@ struct RoutePair {
     float rs_w = 0.0f;   // (route_pair sets these from MAYA_DS4_RESIDENT_SKIP_W / _TOPK)
     int rs_k = 0;
 };
-bool route_pair(const RoutePair& a, cudaStream_t s);
+bool route_pair(const RoutePair& a, cudaStream_t s, bool fast = false);
 /// Waits (one thread, on the device) until *seq_ptr == seq.
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s);
 /// The helper GPU's share of request seq (DS4_HELPER): waits on the device until req holds it - or a later one, or
