@@ -15405,6 +15405,23 @@ struct Model::Impl {
         }
         // The hottest first, each to the helper with room whose pool holds the least routing share for its size, so every
         // layer's picks split across the helpers in proportion to their pools and none is the straggler
+        // DS4_HELPER_FAST=1: fill helpers in descending memory-bandwidth order (HR host discounted) to spare slow GPUs.
+        const char* fv = ds4_env("DS4_HELPER_FAST");
+        const bool helper_fast = fv != nullptr && std::atoi(fv) != 0;
+        std::vector<size_t> h_ord(nh);
+        if (helper_fast) {
+            std::vector<double> h_bw(nh, 1.0);
+            for (size_t h = 0; h < nh; ++h) {
+                h_ord[h] = h;
+                if (hlp[h].id < 0) continue;
+                int clk = 0, bus = 0;
+                if (cudaDeviceGetAttribute(&clk, cudaDevAttrMemoryClockRate, hlp[h].id) == cudaSuccess &&
+                    cudaDeviceGetAttribute(&bus, cudaDevAttrGlobalMemoryBusWidth, hlp[h].id) == cudaSuccess)
+                    h_bw[h] = (double) clk * (double) bus * (h == 0 && hr_bytes > 0 ? 0.85 : 1.0);
+                else (void) cudaGetLastError();
+            }
+            std::stable_sort(h_ord.begin(), h_ord.end(), [&](size_t a, size_t b_) { return h_bw[a] > h_bw[b_]; });
+        }
         double took = 0, left = 0;
         std::vector<double> took_h(nh, 0.0);
         struct At {
@@ -15416,7 +15433,11 @@ struct Model::Impl {
             const size_t b = align256(L[(size_t) x.layer].blob);
             size_t best = nh;
             double best_load = 0.0;
-            for (size_t h = 0; h < nh; ++h) {
+            if (helper_fast) {
+                for (size_t h : h_ord) {
+                    if (hlp[h].used + b <= hlp[h].cap - (h == 0 ? hr_bytes : 0)) { best = h; break; }
+                }
+            } else for (size_t h = 0; h < nh; ++h) {
                 if (hlp[h].used + b > hlp[h].cap - (h == 0 ? hr_bytes : 0)) continue;
                 const double load = took_h[h] / (double) hlp[h].cap;
                 if (best == nh || load < best_load) {
