@@ -327,7 +327,17 @@ float dspark_cum_default() {
 // comparing rounds that drafted.  MAYA_DS4_LOOKUP_TRUST=0: every round drafts first (a request's lookup_trust=0|1 key
 // over it)
 struct Lookup {
-    maya::spec::SuffixDrafter sfx;
+    struct Lane {
+        maya::spec::SuffixDrafter sfx;
+        std::vector<int32_t> hist;
+        bool valid = false;
+        bool ablate = false;
+        Lane(int min_match, size_t cap) : sfx(min_match, 64, cap) {}
+    };
+    std::vector<std::unique_ptr<Lane>> lanes;
+    int min_match_ = 3;
+    size_t cap_ = 0;
+    size_t cur_lane_ = 0;
     maya::spec::DraftPolicy policy;   // (over the engine's life: the round times are this PC's)
     std::vector<int32_t> buf;
     long long windows = 0, offered = 0, accepted = 0;   // the lookup's own rounds and drafts
@@ -335,11 +345,18 @@ struct Lookup {
     double draft_ms = 0.0;                               // a draft()'s time (EMA)
     int t_mtp = 1;                                       // the last drafted window's tokens (trust's comparison)
     int trust_req = -1;                                  // the request's lookup_trust key (-1: MAYA_DS4_LOOKUP_TRUST)
-    Lookup(int min_match, int max_t, size_t cap) : sfx(min_match, 64, cap), policy(max_t), buf((size_t) max_t) {}
-    void start(const std::vector<int32_t>& ctx) {   // a request's history: what the state has consumed
-        sfx.reset();
-        sfx.append(ctx.data(), ctx.size());
+    Lookup(int min_match, int max_t, size_t cap, int nseq = 1)
+        : lanes((size_t) std::max(1, nseq)), min_match_(min_match), cap_(cap), policy(max_t), buf((size_t) max_t) {
+        lanes[0] = std::make_unique<Lane>(min_match_, cap_);
     }
+    maya::spec::SuffixDrafter& sfx() { return lanes[cur_lane_]->sfx; }
+    const maya::spec::SuffixDrafter& sfx() const { return lanes[cur_lane_]->sfx; }
+    void append(int32_t tok) {
+        Lane& ln = *lanes[cur_lane_];
+        ln.sfx.append(tok);
+        if (ln.valid) ln.hist.push_back(tok);
+    }
+    void start(const std::vector<int32_t>& ctx, int seq = 0, bool ablate = false);
 };
 
 // DS4_ROUND_LOG=<file>: a line a decoding round that drafted (appended) - the tag (ids: the CLI's run, p<n>: a
@@ -386,6 +403,43 @@ const char* ds4_env(const char* name) {
     return v != nullptr ? v : std::getenv(name);
 }
 
+inline bool lk_reuse_on() {
+    static const bool on = [] {
+        const char* e = ds4_env("DS4_LK_REUSE");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return on;
+}
+
+inline void Lookup::start(const std::vector<int32_t>& ctx, int seq, bool ablate) {
+    if (!lk_reuse_on()) {
+        cur_lane_ = 0;
+        Lane& ln = *lanes[0];
+        ln.sfx.reset();
+        ln.sfx.append(ctx.data(), ctx.size());
+        ln.hist.clear();
+        ln.valid = false;
+        return;
+    }
+    cur_lane_ = (seq >= 0 && (size_t) seq < lanes.size()) ? (size_t) seq : 0;
+    if (!lanes[cur_lane_]) lanes[cur_lane_] = std::make_unique<Lane>(min_match_, cap_);
+    Lane& ln = *lanes[cur_lane_];
+    if (ln.valid && ln.ablate == ablate && ln.hist.size() <= ctx.size() &&
+        std::equal(ln.hist.begin(), ln.hist.end(), ctx.begin())) {
+        if (ctx.size() > ln.hist.size()) {
+            const size_t n0 = ln.hist.size();
+            ln.sfx.append(ctx.data() + n0, ctx.size() - n0);
+            ln.hist.insert(ln.hist.end(), ctx.begin() + (std::ptrdiff_t) n0, ctx.end());
+        }
+    } else {
+        ln.sfx.reset();
+        ln.sfx.append(ctx.data(), ctx.size());
+        ln.hist = ctx;
+        ln.ablate = ablate;
+        ln.valid = true;
+    }
+}
+
 // DS4_DRAFT_COST=1 (MAYA_DS4_DRAFT_COST): DSpark's window by what a verified row costs on this PC, in place of the
 // fixed cut on the product of the confidences (MAYA_DS4_DSPARK_CUM) - the cost-aware window of
 // maya/spec/draft_policy.hpp.  Under the floor on each draft's own confidence (dspark_conf), a request alone verifies
@@ -427,15 +481,15 @@ bool round(maya::ds4::Model& m, int tok, int room, bool spec, float conf_min, fl
         std::vector<float> conf;
         // (the lookup's proposal first: with one, the drafter makes its first row even past the cut - the lazy head
         //  would skip it at a cut first draft, leaving none to weigh the lookup against; past it, the lazy cut)
-        const int k = lk != nullptr ? lk->sfx.propose(std::min(room, m.verify_max()) - 1, lk->buf.data()) : 0;
+        const int k = lk != nullptr ? lk->sfx().propose(std::min(room, m.verify_max()) - 1, lk->buf.data()) : 0;
         // a trusted lookup (Lookup, above): its window verified alone, no draft this round
         static const bool trust_on = [] {
             const char* e = ds4_env("DS4_LOOKUP_TRUST");
             return e == nullptr || std::atoi(e) != 0;
         }();
         const bool trust = k > 0 && (lk->trust_req < 0 ? trust_on : lk->trust_req != 0);
-        if (trust && lk->draft_ms > 0.0 && lk->policy.trust(lk->t_mtp, k, lk->sfx.last_match())) {
-            match = lk->sfx.last_match();
+        if (trust && lk->draft_ms > 0.0 && lk->policy.trust(lk->t_mtp, k, lk->sfx().last_match())) {
+            match = lk->sfx().last_match();
             const int t = lk->policy.choose(lk->t_mtp, k, match).t;
             const std::vector<int> lw(lk->buf.begin(), lk->buf.begin() + (t - 1));
             int acc = 0, next = -1;
@@ -486,7 +540,7 @@ bool round(maya::ds4::Model& m, int tok, int room, bool spec, float conf_min, fl
         bool from_lk = false;
         if (lk != nullptr) lk->t_mtp = keep + 1;
         if (lk != nullptr && !drafts.empty() && !m.drafts_sampled()) {
-            match = lk->sfx.last_match();
+            match = lk->sfx().last_match();
             if (k > 0 && lk->buf[0] == drafts[0]) {
                 const maya::spec::DraftPolicy::Pick pk = lk->policy.choose(keep + 1, k, match);
                 if (pk.lookup) {
@@ -526,8 +580,8 @@ bool round(maya::ds4::Model& m, int tok, int room, bool spec, float conf_min, fl
     // lookup's drafts alone, where the policy expects more committed tokens a millisecond from them than from a plain
     // step - each a point to verify(), as beside DSpark
     if (lk != nullptr && !drafter && room > 1) {
-        const int k = lk->sfx.propose(std::min(room, m.verify_max()) - 1, lk->buf.data());
-        match = lk->sfx.last_match();
+        const int k = lk->sfx().propose(std::min(room, m.verify_max()) - 1, lk->buf.data());
+        match = lk->sfx().last_match();
         maya::spec::DraftPolicy::Pick pk;
         if (k > 0) pk = lk->policy.choose(1, k, match);
         if (pk.lookup && pk.t > 1) {
@@ -2007,7 +2061,7 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
         maya::ds4::LogprobRow tok_lp;
         std::vector<maya::ds4::LogprobRow> got_lp;
         if (r.logprobs >= 0) tok_lp = lp_take(m, 1).back();
-        if (lk) lk->start(m.tokens());
+        if (lk) lk->start(m.tokens(), m.seq_bound(), m.ablating());
         const long long lk_w0 = lk ? lk->windows : 0, lk_o0 = lk ? lk->offered : 0, lk_a0 = lk ? lk->accepted : 0,
                         lk_t0 = lk ? lk->trusted : 0;
         // STAT for the Monitor every 8 tokens and at the end, over this answer so far: the GLM engine's keys (speed, the
@@ -2038,7 +2092,7 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
             if (r.logprobs >= 0) lp_out(-1, tok, tok_lp);
             beat();
             ++produced;
-            if (lk) lk->sfx.append(tok);
+            if (lk) lk->append(tok);
             if (in_think && tok == r.think_end) in_think = false;   // (closed: by the model, or by the budget)
             else if (in_think && r.soft_check(tok, produced)) r.soft_hit = true;   // (#746: closed like the budget)
             if (produced % 8 == 0) stat_line();
@@ -2451,7 +2505,7 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
                     beat();
                     ++a.produced;
                     ++busy_n;
-                    if (lk && lk_owner == a.r.rid) lk->sfx.append(a.tok);
+                    if (lk && lk_owner == a.r.rid) lk->append(a.tok);
                     if (a.in_think && a.tok == a.r.think_end) a.in_think = false;
                     else if (a.in_think && a.r.soft_check(a.tok, a.produced)) a.r.soft_hit = true;
                     bool eos_tok = false;
@@ -2492,8 +2546,8 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
                 // (the prompt lookup alone only: its history follows one request)
                 Lookup* L = a.r.lookup == 0 || acts.size() > 1 ? nullptr : lk;
                 if (L != nullptr && lk_owner != a.r.rid) {   // (its history: what it consumed, then the token written)
-                    L->start(m.tokens());
-                    L->sfx.append(a.tok);
+                    L->start(m.tokens(), a.seq, m.ablating());
+                    L->append(a.tok);
                     lk_owner = a.r.rid;
                 }
                 penalties(a.r);
@@ -4011,7 +4065,7 @@ int main(int argc, char** argv) {
                              "decoding with prompt lookup only (no drafter)\n");
     std::unique_ptr<Lookup> lk;   // (prompt lookup beside DSpark, or alone: one policy over every request of this run)
     if (suffix_draft > 0)
-        lk = std::make_unique<Lookup>(suffix_draft, m.verify_max(), (size_t) m.max_context() + 4096);
+        lk = std::make_unique<Lookup>(suffix_draft, m.verify_max(), (size_t) m.max_context() + 4096, m.seq_count());
     std::unique_ptr<DraftCost> dc;   // (DS4_DRAFT_COST: DSpark's window by this PC's measured cost, over the run)
     if (const char* v = ds4_env("DS4_DRAFT_COST"); v != nullptr && std::atoi(v) != 0 && m.draft_block() > 0) {
         dc = std::make_unique<DraftCost>(m.verify_max());
@@ -4216,7 +4270,7 @@ int main(int argc, char** argv) {
         int tok = m.sample(temp, 1.0f, temp > 0 ? 64 : 1, 0.0f, cli_seed, counter++);
         std::vector<int> got;
         round_log().tag = "ids";   // (DS4_ROUND_LOG)
-        if (lk) lk->start(m.tokens());
+        if (lk) lk->start(m.tokens(), m.seq_bound(), m.ablating());
         const long long lk_w0 = lk ? lk->windows : 0, lk_o0 = lk ? lk->offered : 0, lk_a0 = lk ? lk->accepted : 0,
                         lk_t0 = lk ? lk->trusted : 0;
         for (;;) {
@@ -4227,7 +4281,7 @@ int main(int argc, char** argv) {
             out.push_back(tok);
             std::printf("%d,", tok);
             std::fflush(stdout);
-            if (lk) lk->sfx.append(tok);
+            if (lk) lk->append(tok);
             if (tok == 1 || (int) out.size() >= n) break;
             if (got.empty()) {
                 int off = 0, acc = 0;
