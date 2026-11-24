@@ -1403,7 +1403,8 @@ Turing and AMD the setting does nothing.
 
 | Setting | Default | |
 | --- | --- | --- |
-| `MAYA_DS4_Q8MV_TC` | off (0) | `1`: Q8_0 GEMVs of 3 to 16 columns on the tensor cores (the same bits); `2`: two columns too (no faster on an RTX 3090) |
+| `MAYA_DS4_Q8MV_OPT` | on (`1`) | `0`: disable the optimized Q8_0 decode/window GEMV dispatch (zero-shared-memory streaming loader for 1 to 4 columns with exact 3-column dispatch; 16-row tensor-core tiles for 5 to 16 columns on compute capability 8.0+ CUDA) and use the legacy staged/`MAYA_DS4_Q8MV_TC` path (the same bits either way) |
+| `MAYA_DS4_Q8MV_TC` | off (0) | `1`: when `MAYA_DS4_Q8MV_OPT=0`, run Q8_0 GEMVs of 3 to 16 columns on the tensor cores (the same bits); `2`: two columns too (no faster on an RTX 3090) |
 
 ## DeepSeek: tensor-parallel layers without the host
 

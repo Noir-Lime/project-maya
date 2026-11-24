@@ -479,6 +479,72 @@ __device__ __forceinline__ float q8_words_g(const uint8_t* __restrict__ p, int* 
 
 // grid (max rows / 8, jobs): a Q8_0 matrix's rows against the jobs' int8 activations (q8_quant's: activation c of job
 // j at xq + c k, its scales at xd + c k / 32) - a warp a row, a lane a block a step, the blocks staged (ST) or read
+__device__ __forceinline__ uint32_t q8_ld_cs(const uint32_t* p) {
+#if defined(MAYA_USE_HIP)
+    return *(const volatile uint32_t*) p;
+#elif !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 350
+    return __ldcs(p);
+#else
+    return *p;
+#endif
+}
+
+// Zero-SMEM streaming weight loader with funnelshift (exact bit parity with q8_words_s)
+__device__ __forceinline__ float q8_words_gcs(const uint32_t* p, int i, int* v) {
+    const int o = 34 * i, w = o >> 2, sh = (o & 3) * 8;
+    uint32_t a[9];
+#pragma unroll
+    for (int j = 0; j < 9; ++j) a[j] = q8_ld_cs(p + w + j);
+    uint32_t sw[9];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) sw[j] = __funnelshift_r(a[j], a[j + 1], sh);
+    sw[8] = a[8] >> sh;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) v[j] = (int) __funnelshift_r(sw[j], sw[j + 1], 16);
+    return __half2float(__ushort_as_half((uint16_t) (sw[0] & 0xffffu)));
+}
+
+template <int NC, int MIN_BLK>
+__global__ void __launch_bounds__(128, MIN_BLK) q8_mv_nosm_kw4_kernel(const BfJobs J) {
+    pdl_wait();
+    pdl_trigger();
+    const BfJob& b = J.j[blockIdx.y];
+    const int row = (int) blockIdx.x * 4 + ((int) threadIdx.x >> 5), lane = (int) threadIdx.x & 31;
+    if (row >= b.n) return;
+    const uint8_t* w = (const uint8_t*) b.w + (size_t) row * b.ld;
+    const int nb = b.k / 32;
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+    for (int b0 = 0; b0 < nb; b0 += 32) {
+        const int nbk = min(32, nb - b0), kb = b0 + lane;
+        if (lane >= nbk) continue;
+        int v[8];
+        const float dw = q8_words_gcs((const uint32_t*) (w + (size_t) b0 * kQ8Bytes), lane, v);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (c < b.ncol) {
+                const int4* xp = (const int4*) (b.xq + (size_t) c * b.k + (size_t) kb * 32);
+                const int4 xa = __ldg(xp), xb = __ldg(xp + 1);
+                int sum = __dp4a(v[0], xa.x, 0);
+                sum = __dp4a(v[1], xa.y, sum);
+                sum = __dp4a(v[2], xa.z, sum);
+                sum = __dp4a(v[3], xa.w, sum);
+                sum = __dp4a(v[4], xb.x, sum);
+                sum = __dp4a(v[5], xb.y, sum);
+                sum = __dp4a(v[6], xb.z, sum);
+                sum = __dp4a(v[7], xb.w, sum);
+                acc[c] = fmaf(dw * __ldg(b.xd + (size_t) c * nb + kb), (float) sum, acc[c]);
+            }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c)
+        if (c < b.ncol) {
+            const float v = warp_sum(acc[c]);
+            if (lane == 0) b.y[c * b.ycs + row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
+        }
+}
+
 template <int NC, bool ST>
 __global__ void __launch_bounds__(kThreads) q8_mv_kernel(const BfJobs J) {
     pdl_wait();
@@ -1497,6 +1563,14 @@ bool q8_share() {   // jobs on one input share its rounding (DS4_Q8_SHARE=0: eac
     return on;
 }
 void q8_mode(int m) { g_q8_mode.store(m, std::memory_order_relaxed); }
+bool q8_mv_opt() {   // Q8_0 decode/window GEMV path (MAYA_DS4_Q8MV_OPT=0: legacy staged/TC dispatch)
+    static const bool on = [] {
+        const bool b = q8_env("DS4_Q8MV_OPT");
+        if (!b) std::fprintf(stderr, "ds4: Q8_0 decode/window GEMV optimization disabled (MAYA_DS4_Q8MV_OPT=0)\n");
+        return b;
+    }();
+    return on;
+}
 
 // DS4_Q8_CHECK=1 (at load, before any request): eight jobs - k 5120 / 2304 / 256 / 32, rows 1 / 4 / 16, strided rows,
 // two jobs reading one input with other k, two of the same input, stride, rows and k, values with zero blocks,
@@ -1783,21 +1857,35 @@ bool q8_tc_dev() {
 #endif
 }
 template <int NC>
-void mv_launch(int f, const BfJobs& J, int nj, int max_n, bool vec, cudaStream_t s) {
+void mv_launch(int f, const BfJobs& J, int nj, int max_n, bool vec, cudaStream_t s, bool q8_opt) {
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
     if (f == 1) {
         if (vec) pdl_launch(mx_mv_kernel<NC, true, false>, grid, kThreads, 0, s, J);
         else pdl_launch(mx_mv_kernel<NC, false, false>, grid, kThreads, 0, s, J);
-    } else if (f == 2) {   // (vec here: every row 4-byte aligned, so staged)
-        // DS4_Q8MV_TC=1: the tensor-core kernel for 3..16 columns (2: also 2), the same bits; 32 rows a CTA in
-        // 16-block chunks when that still gives 128+ CTAs, else 16 a CTA in 32-block chunks - the microbench's best
-        // (MAYA_DS4_Q8MV_TC, else DS4_Q8MV_TC; compute capability 8.0+, CUDA - q8_tc_dev)
+    } else if (f == 2) {   // (vec here: every row 4-byte aligned, so staged or zero-SMEM streaming)
+        // DS4_Q8MV_OPT=1 (default on; MAYA_DS4_Q8MV_OPT=0 opts out): 1..4 columns take the zero-SMEM 4-warp kernel
+        // with exact NC=3; 5..16 columns take 16-row MT=1 tensor-core tiles on sm_80+ CUDA when aligned, else kw4.
+        // When opted out (0), DS4_Q8MV_TC=1..2 and the legacy staged q8_mv_kernel path run as before.
         static const int tc = [] {
             const char* v = std::getenv("MAYA_DS4_Q8MV_TC");
             if (v == nullptr) v = std::getenv("DS4_Q8MV_TC");
             return v != nullptr ? std::atoi(v) : 0;
         }();
-        if (vec && tc > 0 && (NC >= 4 || (tc >= 2 && NC == 2)) && q8_tc_ok(J, nj) && q8_tc_dev()) {
+        if (q8_opt && vec && NC >= 5 && q8_tc_ok(J, nj) && q8_tc_dev()) {
+            if ((max_n + 15) / 16 * nj >= 170)
+                pdl_launch(q8_mv_tc_kernel<NC, 1, 2, 16>, dim3((unsigned) ((max_n + 15) / 16), (unsigned) nj), 256,
+                           (size_t) q8_tc_smem<1, 2, 16>(), s, J);
+            else
+                pdl_launch(q8_mv_tc_kernel<NC, 1, 2, 32>, dim3((unsigned) ((max_n + 15) / 16), (unsigned) nj), 256,
+                           (size_t) q8_tc_smem<1, 2, 32>(), s, J);
+        } else if (q8_opt && vec) {
+            const dim3 kw4_grid((unsigned) ((max_n + 3) / 4), (unsigned) nj);
+            if constexpr (NC == 1) pdl_launch(q8_mv_nosm_kw4_kernel<1, 12>, kw4_grid, 128, 0, s, J);
+            else if constexpr (NC == 2) pdl_launch(q8_mv_nosm_kw4_kernel<2, 10>, kw4_grid, 128, 0, s, J);
+            else if constexpr (NC == 3) pdl_launch(q8_mv_nosm_kw4_kernel<3, 8>, kw4_grid, 128, 0, s, J);
+            else if constexpr (NC == 4) pdl_launch(q8_mv_nosm_kw4_kernel<4, 8>, kw4_grid, 128, 0, s, J);
+            else pdl_launch(q8_mv_nosm_kw4_kernel<NC, 4>, kw4_grid, 128, 0, s, J);
+        } else if (vec && tc > 0 && (NC >= 4 || (tc >= 2 && NC == 2)) && q8_tc_ok(J, nj) && q8_tc_dev()) {
             if ((max_n + 31) / 32 * nj >= 128)
                 pdl_launch(q8_mv_tc_kernel<NC, 2, 2, 16>, dim3((unsigned) ((max_n + 31) / 32), (unsigned) nj), 256,
                            (size_t) q8_tc_smem<2, 2, 16>(), s, J);
@@ -1811,13 +1899,15 @@ void mv_launch(int f, const BfJobs& J, int nj, int max_n, bool vec, cudaStream_t
         else pdl_launch(bf16_mv_kernel<NC, false>, grid, kThreads, 0, s, J);
     }
 }
-void mv_set(int f, const BfJobs& J, int nj, int max_n, int max_c, bool vec, cudaStream_t s) {
+void mv_set(int f, const BfJobs& J, int nj, int max_n, int max_c, bool vec, cudaStream_t s, bool q8_opt) {
     if (nj == 0) return;
-    if (max_c <= 1) mv_launch<1>(f, J, nj, max_n, vec, s);
-    else if (max_c <= 2) mv_launch<2>(f, J, nj, max_n, vec, s);
-    else if (max_c <= 4) mv_launch<4>(f, J, nj, max_n, vec, s);
-    else if (max_c <= 8) mv_launch<8>(f, J, nj, max_n, vec, s);
-    else mv_launch<16>(f, J, nj, max_n, vec, s);
+    if (max_c <= 1) mv_launch<1>(f, J, nj, max_n, vec, s, q8_opt);
+    else if (max_c <= 2) mv_launch<2>(f, J, nj, max_n, vec, s, q8_opt);
+    else if (f == 2 && q8_opt && vec && max_c == 3) mv_launch<3>(f, J, nj, max_n, vec, s, q8_opt);
+    else if (max_c <= 4) mv_launch<4>(f, J, nj, max_n, vec, s, q8_opt);
+    else if (f == 2 && q8_opt && vec && max_c <= 6) mv_launch<6>(f, J, nj, max_n, vec, s, q8_opt);
+    else if (max_c <= 8) mv_launch<8>(f, J, nj, max_n, vec, s, q8_opt);
+    else mv_launch<16>(f, J, nj, max_n, vec, s, q8_opt);
 }
 }  // namespace
 
@@ -1917,7 +2007,8 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre, bool fas
         }
     }
     QR.flush(s);
-    for (int f = 0; f < 3; ++f) mv_set(f, J[f], nj[f], max_n[f], max_c[f], vec[f], s);
+    const bool q8_opt = q8_mv_opt();
+    for (int f = 0; f < 3; ++f) mv_set(f, J[f], nj[f], max_n[f], max_c[f], vec[f], s, q8_opt);
     if (nij > 0 && !iq::mv(IJ, nij, s, fast)) {
         fail("mv: a low-bit job not covered");
         return false;
